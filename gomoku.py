@@ -1,80 +1,161 @@
 import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import tkinter as tk
+import time
 
-BOARD_SIZE = 15
-EMPTY = 0
-BLACK = 1
-WHITE = 2
+# ==========================================
+# 1. 오목 강화학습 환경 (GUI 포함)
+# ==========================================
+class OmokEnvGUI(gym.Env):
+    metadata = {"render_modes": ["ansi", "human"], "render_fps": 4}
 
-def create_board():
-    return np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=int)
+    def __init__(self, render_mode="human"):
+        super().__init__()
+        self.board_size = 15
+        self.render_mode = render_mode
+        
+        # 행동 공간 (0~224) 및 상태 공간 (15x15 배열, 0:빈칸, 1:흑, 2:백)
+        self.action_space = spaces.Discrete(self.board_size ** 2)
+        self.observation_space = spaces.Box(low=0, high=2, shape=(self.board_size, self.board_size), dtype=np.int8)
+        
+        self.board = None
+        self.current_player = 1 # 1: 흑, 2: 백
+        
+        # GUI 설정
+        self.window = None
+        self.cell_size, self.margin = 40, 30
 
-def print_board(board):
-    print("   " + " ".join(f"{i:2}" for i in range(BOARD_SIZE)))
-    for i, row in enumerate(board):
-        row_str = f"{i:2} "
-        for cell in row:
-            if cell == EMPTY:
-                row_str += " ."
-            elif cell == BLACK:
-                row_str += " X"
-            else:
-                row_str += " O"
-        print(row_str)
-    print()
+    def reset(self, seed=None, options=None):
+        """보드를 초기화하고 흑돌 턴으로 시작합니다."""
+        super().reset(seed=seed)
+        self.board = np.zeros((self.board_size, self.board_size), dtype=np.int8)
+        self.current_player = 1
+        return self.board.copy(), {"current_player": self.current_player}
 
-def check_winner(board, row, col, player):
-    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
-    for dr, dc in directions:
-        count = 1
-        for sign in [1, -1]:
-            r, c = row + sign * dr, col + sign * dc
-            while 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE and board[r][c] == player:
-                count += 1
-                r += sign * dr
-                c += sign * dc
-        if count >= 5:
-            return True
-    return False
+    def step(self, action):
+        """에이전트의 행동을 적용하고 상태, 보상, 종료 여부를 반환합니다."""
+        r, c = action // self.board_size, action % self.board_size
+        
+        # 1. 반칙 (이미 돌이 있는 곳) 처리
+        if self.board[r, c] != 0:
+            return self.board.copy(), -10.0, True, False, {"reason": "invalid_move", "winner": 3 - self.current_player}
 
-def get_move(player_name):
-    while True:
-        try:
-            inp = input(f"{player_name}의 차례 (행 열 입력, 예: 7 7): ").strip()
-            row, col = map(int, inp.split())
-            if 0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE:
-                return row, col
-            print(f"0~{BOARD_SIZE - 1} 범위 안에서 입력하세요.")
-        except (ValueError, TypeError):
-            print("올바른 형식으로 입력하세요 (예: 7 7)")
+        # 2. 착수 및 승리/무승부 판정
+        self.board[r, c] = self.current_player
+        if self._check_win(r, c, self.current_player):
+            return self.board.copy(), 1.0, True, False, {"reason": "win", "winner": self.current_player}
+        if not np.any(self.board == 0):
+            return self.board.copy(), 0.0, True, False, {"reason": "draw", "winner": 0}
 
-def play():
-    board = create_board()
-    players = {BLACK: "흑(X)", WHITE: "백(O)"}
-    current = BLACK
+        # 3. 턴 교체
+        self.current_player = 3 - self.current_player
+        return self.board.copy(), 0.0, False, False, {"current_player": self.current_player}
 
-    print("=== 오목 게임 ===")
-    print(f"15x15 보드, 5개를 먼저 연속으로 놓으면 승리!")
-    print()
+    def _check_win(self, row, col, player):
+        """4방향 탐색으로 5목 완성 여부를 논리적으로 확인합니다."""
+        directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
+        for dr, dc in directions:
+            count = 1
+            for step in (1, -1): # 정방향(1), 역방향(-1) 탐색
+                r, c = row + dr * step, col + dc * step
+                while 0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == player:
+                    count += 1
+                    r += dr * step; c += dc * step
+            if count >= 5: return True
+        return False
 
-    for turn in range(BOARD_SIZE * BOARD_SIZE):
-        print_board(board)
-        row, col = get_move(players[current])
+    def render(self):
+        """Tkinter 창을 새로고침하여 현재 보드를 시각화합니다."""
+        if self.render_mode != "human": return
+        
+        if self.window is None:
+            self.window = tk.Tk()
+            self.window.title("AI 오목 대전 시뮬레이터")
+            size = (self.board_size - 1) * self.cell_size + self.margin * 2
+            self.canvas = tk.Canvas(self.window, width=size, height=size, bg="#DCB35C")
+            self.canvas.pack()
 
-        if board[row][col] != EMPTY:
-            print("이미 돌이 놓인 자리입니다. 다시 입력하세요.")
-            continue
+        self.canvas.delete("all")
+        
+        # 격자선 그리기
+        for i in range(self.board_size):
+            start, end = self.margin + i * self.cell_size, self.margin + (self.board_size - 1) * self.cell_size
+            self.canvas.create_line(self.margin, start, end, start)
+            self.canvas.create_line(start, self.margin, start, end)
 
-        board[row][col] = current
+        # 돌 그리기
+        for r in range(self.board_size):
+            for c in range(self.board_size):
+                if self.board[r, c] != 0:
+                    x, y = self.margin + c * self.cell_size, self.margin + r * self.cell_size
+                    rad = self.cell_size // 2 - 2
+                    color = "black" if self.board[r, c] == 1 else "white"
+                    self.canvas.create_oval(x - rad, y - rad, x + rad, y + rad, fill=color, outline="black")
 
-        if check_winner(board, row, col, current):
-            print_board(board)
-            print(f"{players[current]} 승리!")
-            return
+        # 화면 비동기 업데이트 (mainloop 대체)
+        self.window.update_idletasks()
+        self.window.update()
 
-        current = WHITE if current == BLACK else BLACK
+    def close(self):
+        if self.window: self.window.destroy(); self.window = None
 
-    print_board(board)
-    print("무승부!")
+# ==========================================
+# 2. 에이전트 클래스 (여기서부터 알고리즘 작성 필요)
+# ==========================================
+class Agent1:
+    """무작위 위치에 착수하는 에이전트"""
+    def __init__(self, name="Random_Black(●)"): self.name = name
+    def select_action(self, state):
+        valid = np.where(state.flatten() == 0)[0]
+        return np.random.choice(valid) if len(valid) > 0 else 0
+
+class Agent2:
+    """중앙(7, 7)과 가장 가까운 빈칸에 착수하는 에이전트"""
+    def __init__(self, name="Center_White(○)"): self.name = name
+    def select_action(self, state):
+        board_size, center = state.shape[0], state.shape[0] // 2
+        valid = np.where(state.flatten() == 0)[0]
+        if len(valid) == 0: return 0
+        
+        # 맨해튼 거리가 가장 짧은 액션 선택
+        best_action = min(valid, key=lambda a: abs(a // board_size - center) + abs(a % board_size - center))
+        return best_action
+
+# ==========================================
+# 3. 대결 실행 루프 (Arena)
+# ==========================================
+def main():
+    env = OmokEnvGUI(render_mode="human")
+    agent1, agent2 = Agent1(), Agent2()
+    
+    state, info = env.reset()
+    env.render()
+    terminated = False
+    
+    print(f"=== ⚔️ {agent1.name} vs {agent2.name} 대결 시작 ===")
+    
+    while not terminated:
+        # 턴에 따른 상태 반전 논리 (상대는 항상 자신이 흑돌인 것처럼 착각하게 만듦)
+        if info["current_player"] == 1:
+            action = agent1.select_action(state)
+        else:
+            inverted_state = np.where(state == 1, 2, np.where(state == 2, 1, 0))
+            action = agent2.select_action(inverted_state)
+            
+        state, reward, terminated, _, info = env.step(action)
+        env.render()
+        time.sleep(0.1) # 시각적 확인을 위한 지연
+
+    # 결과 판정
+    print("\n=== 🏁 대결 종료 ===")
+    winner = info.get("winner")
+    if winner == 1: print(f"🎉 {agent1.name} 승리!")
+    elif winner == 2: print(f"🎉 {agent2.name} 승리! (중앙 선호 전략)")
+    else: print("🤝 무승부!")
+        
+    time.sleep(3)
+    env.close()
 
 if __name__ == "__main__":
-    play()
+    main()
