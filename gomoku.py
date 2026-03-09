@@ -103,6 +103,48 @@ class OmokEnvGUI(gym.Env):
 # ==========================================
 # 2. 에이전트 클래스 (여기서부터 알고리즘 작성 필요)
 # ==========================================
+class HumanAgent:
+    """
+    마우스 클릭 이벤트를 통해 사용자가 직접 착수하는 에이전트입니다.
+    """
+    def __init__(self, env, name="Human(👤)"):
+        self.name = name
+        self.env = env
+        self.clicked_action = None
+        self.current_state = None
+
+    def select_action(self, state):
+        """사용자가 화면을 클릭할 때까지 코드 실행을 일시 정지하고 대기합니다."""
+        self.clicked_action = None
+        self.current_state = state
+        
+        # 1. 마우스 왼쪽 클릭 이벤트 활성화
+        self.env.canvas.bind("<Button-1>", self._click_handler)
+        
+        # 2. 클릭될 때까지 무한 대기 (화면은 멈추지 않도록 update 호출)
+        while self.clicked_action is None:
+            self.env.window.update()
+            time.sleep(0.05) # CPU 과부하 방지
+            
+        # 3. 행동 결정 완료 시 이벤트 해제 (AI 턴에 클릭 방지)
+        self.env.canvas.unbind("<Button-1>")
+        
+        return self.clicked_action
+
+    def _click_handler(self, event):
+        """마우스 클릭 시 좌표를 행동(Action) 인덱스로 변환합니다."""
+        # 클릭한 픽셀 위치를 오목판 논리적 좌표(행, 열)로 변환
+        c = round((event.x - self.env.margin) / self.env.cell_size)
+        r = round((event.y - self.env.margin) / self.env.cell_size)
+        
+        # 보드 범위 내인지 확인
+        if 0 <= r < self.env.board_size and 0 <= c < self.env.board_size:
+            action = r * self.env.board_size + c
+            
+            # 유효한 빈칸(0)을 클릭했을 때만 값 업데이트 (반칙 클릭 무시)
+            if self.current_state.flatten()[action] == 0:
+                self.clicked_action = action
+
 class Agent1:
     """무작위 위치에 착수하는 에이전트"""
     def __init__(self, name="Random_Black(●)"): self.name = name
@@ -127,7 +169,8 @@ class Agent2:
 # ==========================================
 def main():
     env = OmokEnvGUI(render_mode="human")
-    agent1, agent2 = Agent1(), Agent2()
+    agent1 = HumanAgent(env, name="Human_Black(●)")
+    agent2 = Agent2()
     
     state, info = env.reset()
     env.render()
