@@ -231,25 +231,111 @@ class KhyAgent:
             if count >= 5: return True
         return False
 
-class Agent2:
-    """중앙(7, 7)과 가장 가까운 빈칸에 착수하는 에이전트"""
-    def __init__(self, name="Center_White(○)"): self.name = name
+class HeuristicAgent:
+    """
+    이전 보상 설계 로직을 바탕으로, 자신(1)의 유리한 패턴을 만들거나
+    상대(2)의 치명적 패턴을 방어하는 위치를 계산하여 착수하는 에이전트입니다.
+    """
+    def __init__(self, name="Heuristic_AI"):
+        self.name = name
+
     def select_action(self, state):
-        board_size, center = state.shape[0], state.shape[0] // 2
-        valid = np.where(state.flatten() == 0)[0]
-        if len(valid) == 0: return 0
-        
-        # 맨해튼 거리가 가장 짧은 액션 선택
-        best_action = min(valid, key=lambda a: abs(a // board_size - center) + abs(a % board_size - center))
-        return best_action
+        board_size = state.shape[0]
+        valid_moves = np.where(state.flatten() == 0)[0]
+        if len(valid_moves) == 0: return 0
+
+        # 보드가 비어있다면 중앙(7, 7)에 착수
+        if np.sum(state != 0) == 0:
+            return (board_size // 2) * board_size + (board_size // 2)
+
+        best_score = -float('inf')
+        best_actions = []
+
+        # [성능 최적화] 연산 시간을 줄이기 위해 기존 돌 주변 반경 2칸 이내의 빈칸만 탐색 후보로 선정
+        candidates = self._get_candidate_moves(state, board_size)
+        if not candidates:
+            candidates = valid_moves
+
+        for action in candidates:
+            r, c = action // board_size, action % board_size
+            
+            # 1. 내가 착수했을 때의 공격 점수 (Player 1 기준)
+            offense_score = self._evaluate_position(state, r, c, player=1)
+            # 2. 상대가 착수했을 때의 방어 점수 (Player 2 기준)
+            defense_score = self._evaluate_position(state, r, c, player=2)
+            
+            # 방어에 약간의 가중치를 더 주어 안정적으로 플레이 (1.1배)
+            total_score = offense_score + (defense_score * 1.1)
+
+            if total_score > best_score:
+                best_score = total_score
+                best_actions = [action]
+            elif total_score == best_score:
+                best_actions.append(action) # 동점일 경우 후보에 추가
+
+        # 동점인 행동 중 무작위 선택하여 패턴 고착화 방지
+        return np.random.choice(best_actions)
+
+    def _get_candidate_moves(self, state, board_size):
+        """기존 돌 반경 2칸 이내의 빈칸 인덱스만 추출합니다."""
+        candidates = set()
+        occupied = np.argwhere(state != 0)
+        for r, c in occupied:
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < board_size and 0 <= nc < board_size and state[nr, nc] == 0:
+                        candidates.add(nr * board_size + nc)
+        return list(candidates)
+
+    def _evaluate_position(self, state, row, col, player):
+        """특정 위치에 돌을 놓았을 때 생성되는 패턴의 논리적 가치를 점수로 환산합니다."""
+        directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
+        score = 0
+        board_size = state.shape[0]
+
+        for dr, dc in directions:
+            consecutive = 1
+            open_ends = 0
+
+            # 양방향 탐색
+            for step in (1, -1):
+                r, c = row + dr * step, col + dc * step
+                while 0 <= r < board_size and 0 <= c < board_size:
+                    if state[r, c] == player:
+                        consecutive += 1
+                    elif state[r, c] == 0:
+                        open_ends += 1
+                        break # 빈칸을 만나면 열린 끝으로 간주하고 중단
+                    else:
+                        break # 상대 돌을 만나면 막힌 것으로 간주하고 중단
+                    r += dr * step
+                    c += dc * step
+
+            # 패턴별 가중치 (0.0 ~ 1.0 스케일로 정규화 및 우선순위 엄격 유지)
+            if consecutive >= 5:
+                score += 1.0       # 5목 완성 (승리/패배 직결, 최우선)
+            elif consecutive == 4:
+                if open_ends == 2: 
+                    score += 0.1   # 열린 4목 (다음 턴 무조건 승리)
+                elif open_ends == 1: 
+                    score += 0.01  # 닫힌 4목 (방어 필수 유도)
+            elif consecutive == 3:
+                if open_ends == 2: 
+                    score += 0.001 # 열린 3목 (공격 전개)
+            elif consecutive == 2:
+                if open_ends == 2: 
+                    score += 0.0001 # 열린 2목 (초반 자리 선점)
+                
+        return score
 
 # ==========================================
 # 3. 대결 실행 루프 (Arena)
 # ==========================================
 def main():
     env = OmokEnvGUI(render_mode="human")
-    agent1 = KhyAgent(simulations_per_move=1000)
-    agent2 = Agent2()
+    agent1 = HumanAgent(env)
+    agent2 = HeuristicAgent(name="Heuristic_AI")
     
     state, info = env.reset()
     env.render()
@@ -277,7 +363,7 @@ def main():
     print("\n=== 🏁 대결 종료 ===")
     winner = info.get("winner")
     if winner == 1: print(f"🎉 {agent1.name} 승리!")
-    elif winner == 2: print(f"🎉 {agent2.name} 승리! (중앙 선호 전략)")
+    elif winner == 2: print(f"🎉 {agent2.name} 승리!")
     else: print("🤝 무승부!")
         
     time.sleep(3)
