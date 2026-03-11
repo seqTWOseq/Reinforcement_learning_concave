@@ -259,35 +259,200 @@ class KhyAgent:
 
     # 행동 선택 로직
     def select_action(self, state):
-        valid_moves = np.where(state.flatten() == 0)[0]
-        if len(valid_moves) == 0:
+        raw_valid_moves = np.where(state.flatten() == 0)[0]
+        if len(raw_valid_moves) == 0:
             return 0
+        
+        board_size = state.shape[0]
 
+        # 반사 신경 (확실한 킬각/위기는 즉시 착수)
+        occupied = np.argwhere(state != 0)
+        if len(occupied) == 0:
+            # 첫 수는 무조건 바둑판의 정중앙(천원)에 착수!
+            return (board_size // 2) * board_size + (board_size // 2)
+        else:
+            # 기존 돌들 주변 반경 2칸 이내만 탐색 후보로 선정
+            sensible_moves = set()
+            for r, c in occupied:
+                for dr in range(-2, 3):
+                    for dc in range(-2, 3):
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < board_size and 0 <= nc < board_size and state[nr, nc] == 0:
+                            sensible_moves.add(nr * board_size + nc)
+            # 좁혀진 후보군을 valid_moves로 확정
+            valid_moves = np.array(list(sensible_moves))
+            
         urgent_move = self._find_urgent_move(state, valid_moves)
         if urgent_move is not None:
-            # 치명적 위기나 기회가 있다면, 뇌(CNN) 연산을 생략하고 반사 신경으로 즉시 착수!
             return urgent_move
 
+        # 탐험 (Epsilon)
         if np.random.rand() <= self.epsilon:
-            # 탐험: 긴급 상황이 아닐 때만 창의적인(랜덤) 수를 둡니다.
             return np.random.choice(valid_moves)
         
-        # CNN을 통해 모든 칸의 가치(Q-Value)를 평가
+        # CNN을 통해 모든 칸의 가치(Q-Value) 초기 평가
         state_tensor = torch.FloatTensor(state).to(self.device)
         self.model.eval()
-
         with torch.no_grad():
             q_values = self.model(state_tensor).squeeze()
-        
         self.model.train()
 
-        # 이미 돌이 놓인 곳은 선택하지 못하도록 마스킹 (-무한대 처리)
+        # 불가능한 수 마스킹 (-무한대)
         mask = torch.ones(225, dtype=torch.bool).to(self.device)
         mask[valid_moves] = False
         q_values[mask] = -float('inf')
 
-        # 가장 가치가 높은(점수가 높은) 좌표 반환
-        return q_values.argmax().item()
+        # 가장 점수가 높은 K의 수
+        K = min(3, len(valid_moves))
+        top_k_actions = torch.topk(q_values, K).indices.cpu().numpy()
+
+        best_action = top_k_actions[0]
+        best_q_value = -float('inf')
+
+        # Top-10 후보들을 각각 50번씩 가상 대국 돌려보기
+        for action in top_k_actions:
+            # 시뮬레이션을 통해 진짜 승률(Q값)을 계산
+            simulated_q = self._simulate_rollouts(state, action, num_rollouts=5, max_depth=5)
+            my_initial_q = q_values[action].item()
+            final_score = (simulated_q * 0.5) + (my_initial_q * 0.5)
+            
+            # 가장 가치가 높은 수를 최종 선택
+            if final_score > best_q_value:
+                best_q_value = final_score
+                best_action = action
+
+        return best_action
+    
+    # 시뮬레이트
+    def _simulate_rollouts(self, state, action, num_rollouts=5, max_depth=5):
+        board_size = state.shape[0]
+        total_score = 0.0
+        
+        for _ in range(num_rollouts):
+            sim_state = state.copy()
+            r, c = action // board_size, action % board_size
+            sim_state[r, c] = 1 
+            
+            current_player = 2 
+            terminated_by_win = False
+            
+            for _ in range(max_depth):
+                valid_moves = np.where(sim_state.flatten() == 0)[0]
+                if len(valid_moves) == 0:
+                    break
+                
+                if current_player == 1:
+                    eval_state = sim_state
+                else:
+                    eval_state = np.where(sim_state == 1, 2, np.where(sim_state == 2, 1, 0))
+                
+                # 강력해진 4단계 반사 신경으로 뻔한 수 방어
+                urgent_move = self._find_urgent_move(eval_state, valid_moves)
+                    
+                if urgent_move is not None:
+                    sim_action = urgent_move
+                else:
+                    # 무거운 파이썬 난수 탐색 대신, 초고속 C++ 기반 CNN 가이드 부활!
+                    # (빨리 승패를 결정지어 10수 루프를 조기 종료시킵니다)
+                    sim_tensor = torch.FloatTensor(eval_state).to(self.device)
+                    self.model.eval()
+                    with torch.no_grad():
+                        q_values = self.model(sim_tensor).squeeze()
+                    self.model.train()
+                
+                    valid_mask = torch.ones(225, dtype=torch.bool).to(self.device)
+                    valid_mask[valid_moves] = False
+                    q_values[valid_mask] = -float('inf')
+                    
+                    K = min(3, len(valid_moves))
+                    top_k_indices = torch.topk(q_values, K).indices.cpu().numpy()
+                    
+                    probabilities = [0.5, 0.3, 0.2][:K]
+                    probabilities /= np.sum(probabilities) 
+                    
+                    sim_action = np.random.choice(top_k_indices, p=probabilities)
+        
+                sr, sc = sim_action // board_size, sim_action % board_size
+                sim_state[sr, sc] = current_player
+                
+                # 누군가 이기면 루프 즉시 폭파 (속도 향상의 핵심)
+                if self._check_pattern(sim_state, sr, sc, current_player, target=5):
+                    if current_player == 1:
+                        total_score += 1.0   
+                    else:
+                        total_score -= 1.0   
+                    terminated_by_win = True
+                    break
+                
+                current_player = 3 - current_player
+                
+            # 10수가 끝난 뒤 최종 형세 판단
+            if not terminated_by_win:
+                if current_player == 1:
+                    final_eval_state = sim_state
+                    sign = 1.0 
+                else:
+                    final_eval_state = np.where(sim_state == 1, 2, np.where(sim_state == 2, 1, 0))
+                    sign = -1.0 
+                    
+                sim_tensor = torch.FloatTensor(final_eval_state).to(self.device)
+                self.model.eval()
+                with torch.no_grad():
+                    leaf_q_values = self.model(sim_tensor).squeeze()
+                self.model.train()
+                
+                valid_mask = torch.ones(225, dtype=torch.bool).to(self.device)
+                valid_mask[np.where(final_eval_state.flatten() == 0)[0]] = False
+                leaf_q_values[valid_mask] = -float('inf')
+                
+                total_score += (sign * leaf_q_values.max().item())
+        
+        return total_score / num_rollouts
+    
+    # 내재적 보상 (공격 포메이션 평가)
+    def get_intrinsic_reward(self, state, action):
+        board_size = state.shape[0]
+        r, c = action // board_size, action % board_size
+        
+        sim_state = state.copy()
+        sim_state[r, c] = 1
+        
+        reward = 0.0
+        directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
+        pattern_counts = {'open_3': 0, 'four': 0}
+        
+        for dr, dc in directions:
+            consecutive = 1
+            open_ends = 0
+            
+            for step in (1, -1):
+                nr, nc = r + dr * step, c + dc * step
+                while 0 <= nr < board_size and 0 <= nc < board_size:
+                    if sim_state[nr, nc] == 1:
+                        consecutive += 1
+                    elif sim_state[nr, nc] == 0:
+                        open_ends += 1
+                        break # 빈칸이면 열린 끝으로 간주하고 중단
+                    else:
+                        break # 막혔으면 중단
+                    nr += dr * step
+                    nc += dc * step
+            
+            # 가치 평가 및 즉각적인 도파민(점수) 분비!
+            if consecutive >= 5:
+                reward += 1.0  # 승리 확정타 (최고점)
+            elif consecutive == 4 and open_ends >= 1:
+                reward += 0.5  # 4목 (치명적 위협)
+                pattern_counts['four'] += 1
+            elif consecutive == 3 and open_ends == 2:
+                reward += 0.2  # 열린 3목 (아주 훌륭한 공격 포메이션)
+                pattern_counts['open_3'] += 1
+            
+        # 오목의 꽃: '양수겸장(4-3, 3-3 등)' 달성 시 엄청난 콤보 보너스!
+        if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
+            reward += 0.8
+        
+        return reward
     
     # 무조건 해야 되는 행동 하드코딩
     def _find_urgent_move(self, state, valid_moves):
@@ -305,7 +470,20 @@ class KhyAgent:
             if self._check_pattern(state, r, c, player=2, target=5):
                 return move
         
-        # 3순위: 상대방이 두면 양쪽이 열린 4목이 되는 자리 (열린 3목 방어)
+        # 3순위: 상대방의 '양수겸장(4-3, 3-3)' 자리를 미리 차단
+        for move in valid_moves:
+            r, c = move // board_size, move % board_size
+            threat_count = 0
+            # 가상으로 상대방이 두었다고 가정하고 패턴 체크
+            if self._check_pattern(state, r, c, player=2, target=4): # 4목 위협
+                threat_count += 1
+            if self._check_pattern(state, r, c, player=2, target=3, open_ends_req=2): # 열린 3 위협
+                threat_count += 1
+            
+            if threat_count >= 2:
+                return move
+        
+        # 4순위: 상대방이 두면 '양쪽이 열린 4목'이 되는 자리 (열린 3 방어)
         for move in valid_moves:
             r, c = move // board_size, move % board_size
             if self._check_pattern(state, r, c, player=2, target=4, open_ends_req=2):
@@ -408,14 +586,14 @@ class KhyAgent:
 # ==========================================
 def main():
     env = OmokEnvGUI(render_mode="human")
-    agent1 = HumanAgent(env)
+    agent2 = HeuristicAgent()
     
     
     model = OmokCNN()
-    agent2 = KhyAgent(model)
+    agent1 = KhyAgent(model)
     
-    agent2.load_model("khy_omok_model_ep6000.pth")
-    agent2.eval_mode()
+    agent1.load_model("khy_omok_model_gen2_final.pth")
+    agent1.eval_mode()
     
     state, info = env.reset()
     env.render()
@@ -439,7 +617,7 @@ def main():
             
         state, reward, terminated, _, info = env.step(action)
         env.render()
-        time.sleep(0.1) # 시각적 확인을 위한 지연
+        time.sleep(0.5) # 시각적 확인을 위한 지연
 
     # 결과 판정
     print("\n=== 🏁 대결 종료 ===")
@@ -541,118 +719,145 @@ def main():
 def train_main():
     env = OmokEnvGUI(render_mode=None)
     
-    # 1) 훈련 주인공 (진화하는 뇌)
     model1 = OmokCNN()  
     agent1 = KhyAgent(model1)
+    print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
-    # 초반에는 휴리스틱의 정답을 스펀지처럼 흡수해야 하므로 헛발질(탐험)을 줄입니다.
-    agent1.epsilon = 0.05
-    agent1.epsilon_decay = 0.999
-
-    # 2) 2막 셀프 플레이용 스파링 파트너 (과거의 나)
     model2 = OmokCNN()
     agent2_self = KhyAgent(model2)
     agent2_self.eval_mode()
     
-    # 3) 1막 스파링 파트너 (수비의 달인 휴리스틱)
     agent_heur = HeuristicAgent(name="Heuristic_White")
     
-    EPISODES = 10000 # 필요시 20000판 등 늘리셔도 좋습니다
-    agent1_wins = 0
-    pbar = tqdm(range(1, EPISODES + 1), desc="진행률")
+    N = 10
+    EPISODES = 10000 
     
-    for episode in pbar:
-        # [페이즈 전환] 2001판째에 셀프 플레이로 진화
-        if episode == 2001:
-            print("[Self 대결 시작]")
-            agent1_wins = 0 # 승률 통계 리셋
-            agent1.epsilon = 0.2 
-            agent1.epsilon_decay = 0.9995
-            
-        state, info = env.reset()
-        terminated = False
+    for gen in range(1, N + 1):
+        print(f"\n{'='*40}")
+        print(f"[Generation {gen}/{N}] 제 {gen}세대")
+        print(f"{'='*40}")
         
-        # 흑(주인공)과 백(스파링 파트너)의 기보를 완벽히 분리하여 기록
-        memory_b = [] 
-        memory_w = []
+        # 매 세대가 시작될 때마다 1막(기초 훈련) 셋팅으로 초기화
+        agent1.epsilon = 0.05
+        agent1.epsilon_decay = 0.998
+        agent1_wins = 0
+        total_phase_steps = 0
         
-        while not terminated:
-            current_player = info["current_player"]
-            
-            if current_player == 1:
-                # [흑돌 = 주인공] 하이브리드 정책으로 착수
-                action = agent1.select_action(state)
-                memory_b.append((state.copy(), action, 0.0))
-                
-                next_state, reward, terminated, _, info = env.step(action)
-                state = next_state
-            else:
-                # [백돌 = 상대방] 시점을 뒤집어서 착수
-                inverted_state = np.where(state == 1, 2, np.where(state == 2, 1, 0))
-                
-                if episode <= 2000:
-                    action = agent_heur.select_action(inverted_state)  # 1막: 휴리스틱
-                else:
-                    action = agent2_self.select_action(inverted_state) # 2막: 과거의 나
+        # 원칙 2. tqdm 진행바는 매 세대마다 새로 생성!
+        pbar = None
+        
+        for episode in range(1, EPISODES + 1):
+            if episode == 1:
+                    # 1막 시작 (1 ~ 2000)
+                    pbar = tqdm(total=2000, desc=f"[Gen {gen}] 1막 VS 휴", position=0, leave=True)
                     
-                # 적의 훌륭한 수비/공격 위치도 빠짐없이 훔쳐서 기록!
-                memory_w.append((inverted_state.copy(), action, 0.0))
+            elif episode == 2001:
+                pbar.close() # 1막 바 닫고 화면에 남김
+                agent1_wins = 0
+                total_phase_steps = 0
+                agent1.epsilon = 0.2  
+                agent1.epsilon_decay = 0.9995
+                # 2막 시작 (2001 ~ 8000)
+                pbar = tqdm(total=6000, desc=f"[Gen {gen}] 2막 VS 셀프", position=0, leave=True)
                 
-                next_state, reward, terminated, _, info = env.step(action)
-                state = next_state
-
-        # ==========================================
-        # 게임 종료 후: 기억 저장 및 대규모 복습 진행
-        # ==========================================
-        winner = info.get("winner")
-        if winner == 1:
-            agent1_wins += 1
-            agent1.memorize_episode(memory_b, 1.0)   # 흑(나)의 승리 비법 저장
-            agent1.memorize_episode(memory_w, -1.0)  # 백(적)의 패인 저장
-        elif winner == 2:
-            agent1.memorize_episode(memory_b, -1.0)  # 흑(나)의 패인 저장
-            agent1.memorize_episode(memory_w, 1.0)   # 백(적)의 카운터 펀치를 황금 정답으로 훔치기!
-        else:
-            # 무승부는 쌍방의 공격 실패이므로 약한 페널티 부여
-            agent1.memorize_episode(memory_b, -0.5)
-            agent1.memorize_episode(memory_w, -0.5)
+            elif episode == 8001:
+                pbar.close() # 2막 바 닫고 화면에 남김
+                agent1_wins = 0 
+                total_phase_steps = 0 
+                agent1.epsilon = 0.0  
+                agent1.epsilon_decay = 1.0 
+                # 3막 시작 (8001 ~ 10000)
+                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 3막 VS 휴", position=0, leave=True)
+                
+            state, info = env.reset()
+            terminated = False
+            memory_b = [] 
+            memory_w = []
+            current_episode_steps = 0 
             
-        # 모은 기보를 4번씩 섞어가며 ResNet 뇌세포를 정교하게 깎아냅니다.
-        for _ in range(4):
-            agent1.replay_experience()
+            while not terminated:
+                current_player = info["current_player"]
+                
+                if current_player == 1:
+                    action = agent1.select_action(state)
+                    step_reward = agent1.get_intrinsic_reward(state, action)
+                    memory_b.append((state.copy(), action, step_reward))
+                    next_state, reward, terminated, _, info = env.step(action)
+                    state = next_state
+                else:
+                    inverted_state = np.where(state == 1, 2, np.where(state == 2, 1, 0))
+                    if episode <= 2000 or episode >= 8001:
+                        action = agent_heur.select_action(inverted_state) 
+                    else:
+                        action = agent2_self.select_action(inverted_state) 
+                        
+                    step_reward = agent1.get_intrinsic_reward(inverted_state, action)
+                    memory_w.append((inverted_state.copy(), action, step_reward))
+                    
+                    next_state, reward, terminated, _, info = env.step(action)
+                    state = next_state
+                    
+                current_episode_steps += 1 
+                
+            total_phase_steps += current_episode_steps
 
-        # 진행 상황 표시 (메모리에 데이터가 얼마나 쌓였는지도 확인 가능)
-        phase = "VS 휴리스틱" if episode <= 2000 else "VS 셀프 플레이"
-        current_ep = episode if episode <= 2000 else (episode - 2000)
-        win_rate = (agent1_wins / current_ep) * 100
+            # --- 게임 종료 후: 기억 저장 및 복습 ---
+            winner = info.get("winner")
+            if winner == 1:
+                agent1_wins += 1
+                agent1.memorize_episode(memory_b, 1.0)   
+                agent1.memorize_episode(memory_w, -1.0)  
+            elif winner == 2:
+                agent1.memorize_episode(memory_b, -1.0)  
+                agent1.memorize_episode(memory_w, 1.0)   
+            else:
+                agent1.memorize_episode(memory_b, -0.5)
+                agent1.memorize_episode(memory_w, -0.5)
+                
+            for _ in range(4):
+                agent1.replay_experience()
 
-        pbar.set_postfix({
-            "모드": phase,
-            "승률": f"{agent1_wins}/{current_ep} ({win_rate:.2f}%)",
-            "앱실론": f"{agent1.epsilon:.3f}",
-            "메모리": f"{len(agent1.memory)}"
-        })
+            # --- 통계 계산 ---
+            if episode <= 2000:
+                current_ep = episode
+            elif episode <= 8000:
+                current_ep = episode - 2000
+            else:
+                current_ep = episode - 8000
+
+            win_rate = (agent1_wins / current_ep) * 100
+            avg_steps = total_phase_steps // current_ep
+
+            pbar.set_postfix({
+                "승률": f"{agent1_wins}/{current_ep} ({win_rate:.2f}%)",
+                "평균": f"{avg_steps}수",
+                "입실론": f"{agent1.epsilon:.3f}",
+                "메모리": f"{len(agent1.memory)}"
+            })
+            pbar.update(1)
+            
+            if episode <= 8000:
+                agent1.decay_epsilon()
+
+            if episode % 1000 == 0:
+                agent1.save_model(f"khy_omok_model_ep{episode}.pth")
+                if 2000 <= episode < 8000:
+                    agent1.epsilon = 0.2  
+                    agent2_self.model.load_state_dict(agent1.model.state_dict())
+                
+        # 한 세대(1만 판)가 끝날 때마다 최종 결과물 저장
+        if pbar is not None:
+            pbar.close()
         
-        # 매 판이 끝날 때마다 조금씩 진지해집니다 (랜덤 착수 감소)
-        agent1.decay_epsilon()
-            
-        # 1000판마다 뇌를 안전하게 백업
-        if episode % 1000 == 0:
-            agent1.save_model(f"khy_omok_model_ep{episode}.pth")
-            # 셀프 플레이 기간(2000판 이후)
-            if episode >= 2000:
-                agent1.epsilon = 0.2  # 새로운 상대를 만났으니 다시 탐험 시작
-                agent2_self.model.load_state_dict(agent1.model.state_dict())
-            
-    # 전체 종료
-    agent1.save_model("khy_omok_model_final.pth")
-    print("\n=== 1만 판의 수읽기 완료 ===")
+        agent1.save_model(f"khy_omok_model_final.pth")
+        
+    print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
     env.close()
     
 # ==========================================
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    main()
-    # train_main()
+    # main()
+    train_main()
