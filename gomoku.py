@@ -1,16 +1,14 @@
-import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import tkinter as tk
-import time
-import os
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from tqdm import tqdm
+import numpy as np
 import random
 from collections import deque
+import torch
+import torch.optim as optim
+import time
+from tqdm import tqdm
 
 from khy_model import OmokCNN
 
@@ -245,145 +243,165 @@ class HeuristicAgent:
 class KhyAgent:
     def __init__(self, model):
         self.name = "Khy_AI"
-        
-        # GPU 엔진 설정 (속도 극대화)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-        print(f"[시스템] {self.device}")
-        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         
-        # 1만 판 학습에 맞춘 동적 앱실론 (탐험과 활용의 균형)
-        self.gamma = 0.99           # 미래 가치 할인율
-        self.epsilon = 1.0          # 초기: 100% 무작위 탐험
-        self.epsilon_min = 0.05     # 후반: 최소 5%의 탐험 유지
-        self.epsilon_decay = 0.9995 # 감가율 (약 6000판에서 최소치 도달)
+        # 탐험률 설정
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.9995
         
-        # 경험 재생 메모리 (파국적 망각 방지)
-        self.memory = deque(maxlen=50000) # 최대 5만 개의 기보 기억
-        self.batch_size = 64              # 한 번 복습할 때 꺼내볼 과거 기억의 수
-
+        # 경험 재생 메모리 (3단계에서 다룰 예정)
+        self.memory = deque(maxlen=50000)
+        self.batch_size = 64
+        self.gamma = 0.99
 
     # 행동 선택 로직
     def select_action(self, state):
-        """현재 오목판을 보고 다음 수를 결정합니다."""
         valid_moves = np.where(state.flatten() == 0)[0]
         if len(valid_moves) == 0:
             return 0
+
+        urgent_move = self._find_urgent_move(state, valid_moves)
+        if urgent_move is not None:
+            # 치명적 위기나 기회가 있다면, 뇌(CNN) 연산을 생략하고 반사 신경으로 즉시 착수!
+            return urgent_move
+
+        if np.random.rand() <= self.epsilon:
+            # 탐험: 긴급 상황이 아닐 때만 창의적인(랜덤) 수를 둡니다.
+            return np.random.choice(valid_moves)
         
-        # 무작위 탐험 (Epsilon)
-        if random.random() < self.epsilon:
-            return random.choice(valid_moves)
-        
-        # 신경망(CNN)의 지식 활용: 가장 점수가 높은 곳 예측
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
+        # CNN을 통해 모든 칸의 가치(Q-Value)를 평가
+        state_tensor = torch.FloatTensor(state).to(self.device)
+        self.model.eval()
+
         with torch.no_grad():
             q_values = self.model(state_tensor).squeeze()
-            
-        best_action = valid_moves[0]
-        max_q = -float('inf')
-        for move in valid_moves:
-            if q_values[move].item() > max_q:
-                max_q = q_values[move].item()
-                best_action = move
-                
-        return best_action
+        
+        self.model.train()
+
+        # 이미 돌이 놓인 곳은 선택하지 못하도록 마스킹 (-무한대 처리)
+        mask = torch.ones(225, dtype=torch.bool).to(self.device)
+        mask[valid_moves] = False
+        q_values[mask] = -float('inf')
+
+        # 가장 가치가 높은(점수가 높은) 좌표 반환
+        return q_values.argmax().item()
     
-    def get_intrinsic_reward(self, state, action):
-        """환경이 주지 않는 칭찬(내적 보상)을 스스로 계산합니다."""
-        row, col = divmod(action, 15)
-        state_2d = state.reshape(15, 15)
-        
-        step_reward = 0.0
-        
-        # 근접 보상: 놓은 자리 주변 8칸에 다른 돌이 하나라도 있는가?
-        for dr in [-1, 0, 1]:
-            for dc in [-1, 0, 1]:
-                if dr == 0 and dc == 0: continue
-                r, c = row + dr, col + dc
-                
-                # 바둑판 범위를 벗어나지 않는지 확인
-                if 0 <= r < 15 and 0 <= c < 15:
-                    if state_2d[r, c] != 0: # 흑돌(1)이든 백돌(2)이든 존재한다면
-                        step_reward += 0.02 # "전투가 벌어지는 곳에 잘 두었어!" 칭찬
-                        return step_reward  # 하나만 발견해도 칭찬하고 종료 (중복 칭찬 방지)
-                    
-        return step_reward # 허허벌판에 두었다면 0점
+    # 무조건 해야 되는 행동 하드코딩
+    def _find_urgent_move(self, state, valid_moves):
+        board_size = state.shape[0]
 
+        # 1순위: 내가 두면 바로 5목이 되는 자리 (승리 확정)
+        for move in valid_moves:
+            r, c = move // board_size, move % board_size
+            if self._check_pattern(state, r, c, player=1, target=5):
+                return move
+        
+        # 2순위: 상대방이 두면 5목이 되는 자리 (즉시 방어)
+        for move in valid_moves:
+            r, c = move // board_size, move % board_size
+            if self._check_pattern(state, r, c, player=2, target=5):
+                return move
+        
+        # 3순위: 상대방이 두면 양쪽이 열린 4목이 되는 자리 (열린 3목 방어)
+        for move in valid_moves:
+            r, c = move // board_size, move % board_size
+            if self._check_pattern(state, r, c, player=2, target=4, open_ends_req=2):
+                return move
+        
+        # 긴급한 상황이 아니면 None을 반환하여 CNN에게 결정권을 넘김
+        return None
+    
+    # 무조건 해야 되는 행동의 패턴
+    def _check_pattern(self, state, r, c, player, target, open_ends_req=0):
+        # 가로, 세로, 대각선 방향 탐색
+        directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
+        board_size = state.shape[0]
 
-    # 학습 및 기억 로직 (에피소드 복기 방식)
-    def memorize_episode(self, history, final_reward):
-        """게임이 끝나면 전체 기보를 평가하여 '오답 노트(메모리)'에 저장만 해둡니다."""
-        G = final_reward
-        # 게임의 마지막 수부터 첫 수까지 거꾸로 거슬러 올라가며 가치(G)를 매김
-        for state, action, step_reward in reversed(history):
-            G = step_reward + (self.gamma * G)
-            self.memory.append((state, action, G))
-            
+        for dr, dc in directions:
+            consecutive = 1
+            open_ends = 0
+
+            # 양방향(+, -)으로 돌이 얼마나 이어져 있는지 확인
+            for step in (1, -1):
+                nr, nc = r + dr * step, c + dc * step
+                while 0 <= nr < board_size and 0 <= nc < board_size:
+                    if state[nr, nc] == player:
+                        consecutive += 1
+                    elif state[nr, nc] == 0:
+                        open_ends += 1
+                        break # 빈칸을 만나면 열린 끝으로 간주하고 탐색 중단
+                    else:
+                        break # 상대 돌이나 벽을 만나면 탐색 중단
+                    nr += dr * step
+                    nc += dc * step
+            # 목표한 개수(target)와 열린 끝(open_ends) 조건을 모두 만족하는가?
+            if consecutive >= target and open_ends >= open_ends_req:
+                return True
+        return False
+    
+    # 기억 장치(Episode Memory 저장)
+    def memorize_episode(self, episode_memory, final_reward):
+        discounted_reward = final_reward # (상태, 행동, 내재적 보상)
+        for state, action, step_reward in reversed(episode_memory):
+            # 최종 승패(보상)에 내재적 보상을 더함
+            total_reward = step_reward + discounted_reward
+            # 메인 메모리(deque)에 기보를 영구 저장
+            self.memory.append((state, action, total_reward))
+            # 과거로 갈수록 보상의 영향력을 할인 (Gamma = 0.99)
+            discounted_reward *= self.gamma
+    
+    # 복습 엔진
     def replay_experience(self):
-        """저장된 오답 노트에서 무작위로 64개를 뽑아 맹훈련(가중치 업데이트)을 합니다."""
-        # 아직 복습할 기억이 64개가 안 모였다면 학습 보류
         if len(self.memory) < self.batch_size:
-            return 
-            
-        # 과거 기억 무작위 추출 (편향 방지)
-        mini_batch = random.sample(self.memory, self.batch_size)
+            return
         
-        states, actions, targets = [], [], []
-        for state, action, G in mini_batch:
+        minibatch = random.sample(self.memory, self.batch_size)
+        states = []
+        actions = []
+        targets = []
+
+        for state, action, reward in minibatch:
             states.append(state)
             actions.append(action)
-            targets.append(G)
-            
-        # 64개의 데이터를 한 번에 GPU로 올려서 병렬 연산 (속도 증가)
-        states_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(self.device)
-        actions_tensor = torch.LongTensor(actions).to(self.device)
+            targets.append(reward)
+        
+        # 파이토치 텐서로 변환하여 GPU 연산 준비
+        states_tensor = torch.FloatTensor(np.array(states)).to(self.device)
+        actions_tensor = torch.LongTensor(actions).unsqueeze(1).to(self.device)
         targets_tensor = torch.FloatTensor(targets).to(self.device)
-        
-        # 모델의 예측값 계산 (64개의 오목판을 동시에 예측)
-        q_values = self.model(states_tensor) 
-        
-        # 64개 결과 중, 내가 실제로 두었던 자리(action)의 예측 점수만 추출
-        current_q = q_values.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
-        
-        # 오차(예측 점수 vs 실제 정답 G) 계산 및 가중치 업데이트
-        loss = nn.MSELoss()(current_q, targets_tensor)
+
+        # 현재 뇌(CNN)가 평가하는 바둑판의 가치(Q-Value) 예측
+        q_values = self.model(states_tensor)
+        # 모델이 예측한 225개의 가치 중, '실제로 두었던 위치(action)'의 가치만 추출
+        current_q = q_values.gather(1, actions_tensor).squeeze()
+        # (내가 예측한 가치 - 실제 얻은 보상)의 평균 제곱 오차(MSE) 계산
+        loss = torch.nn.MSELoss()(current_q, targets_tensor)
+
+        # 오차를 줄이는 방향으로 뇌세포(가중치) 업데이트
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
+    
+    # 유틸
+    def train_mode(self):
+        self.model.train()
+    
+    def eval_mode(self):
+        self.model.eval()
+        self.epsilon = 0.0
+    
+    def save_model(self, filepath):
+        torch.save(self.model.state_dict(), filepath)
 
-
-    # 유틸리티 (모드 전환 및 저장/불러오기)
+    def load_model(self, filepath):
+        self.model.load_state_dict(torch.load(filepath, map_location=self.device, weights_only=True))
+    
     def decay_epsilon(self):
-        """매 판이 끝날 때마다 탐험 확률을 조금씩 낮춥니다."""
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-            self.epsilon = max(self.epsilon_min, self.epsilon)
-
-    def eval_mode(self):
-        """실전 대결 모드: 탐험을 완전히 끄고 배운 대로만 둡니다."""
-        self.epsilon = 0.0
-        self.model.eval()
-        
-    def train_mode(self):
-        """학습 모드: 모델의 신경망을 훈련 상태로 열어둡니다."""
-        if self.epsilon == 0.0:
-            self.epsilon = 1.0 # 다시 백지상태 탐험부터 시작
-        self.model.train()
-        
-    def save_model(self, file_path="khy_omok_model.pth"):
-        """모델의 뇌(가중치)를 파일로 저장합니다."""
-        torch.save(self.model.state_dict(), file_path)
-        
-    def load_model(self, file_path="khy_omok_model.pth"):
-        """저장된 뇌(가중치)를 불러와 탑재합니다."""
-        if os.path.exists(file_path):
-            self.model.load_state_dict(torch.load(file_path, map_location=self.device, weights_only=True))
-            print("[알림] 파일 불러오기 성공")
-            self.eval_mode() # 불러온 직후에는 보통 실전을 하므로 모드 전환
-        else:
-            print("[경고] 파일 불러오기 실패")
 
 # ==========================================
 # 3. 대결 실행 루프 (Arena)
@@ -396,7 +414,7 @@ def main():
     model = OmokCNN()
     agent2 = KhyAgent(model)
     
-    agent2.load_model("khy_omok_model_final.pth")
+    agent2.load_model("khy_omok_model_ep6000.pth")
     agent2.eval_mode()
     
     state, info = env.reset()
@@ -444,7 +462,7 @@ def main():
 #     agent1.train_mode()
     
 #     agent1.epsilon = 0.3
-#     agent1.epsilon_decay = 0.9998
+#     agent1.epsilon_decay = 0.9982
     
 #     model2 = OmokCNN()
 #     agent2 = KhyAgent(model2)
@@ -521,54 +539,66 @@ def main():
 #     env.close()
 
 def train_main():
-    env = OmokEnvGUI(render_mode=None) 
+    env = OmokEnvGUI(render_mode=None)
     
-    model1 = OmokCNN()
+    # 1) 훈련 주인공 (진화하는 뇌)
+    model1 = OmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_model_final.pth")
     agent1.train_mode()
     
-    agent1.epsilon = 0.3
-    agent1.epsilon_decay = 0.9982
-    
+    # 초반에는 휴리스틱의 정답을 스펀지처럼 흡수해야 하므로 헛발질(탐험)을 줄입니다.
+    agent1.epsilon = 0.05
+    agent1.epsilon_decay = 0.999
+
+    # 2) 2막 셀프 플레이용 스파링 파트너 (과거의 나)
     model2 = OmokCNN()
-    agent2 = KhyAgent(model2)
+    agent2_self = KhyAgent(model2)
+    agent2_self.eval_mode()
     
-    agent2.model.load_state_dict(agent1.model.state_dict())
-    agent2.eval_mode()
+    # 3) 1막 스파링 파트너 (수비의 달인 휴리스틱)
+    agent_heur = HeuristicAgent(name="Heuristic_White")
     
-    agent2_heuristic = HeuristicAgent(name="Heuristic_AI")
-    current_opponent = agent2
-    
-    EPISODES = 10000
+    EPISODES = 10000 # 필요시 20000판 등 늘리셔도 좋습니다
     agent1_wins = 0
-    pbar = tqdm(range(1, EPISODES + 1), desc="학습 진행률")
+    pbar = tqdm(range(1, EPISODES + 1), desc="진행률")
     
     for episode in pbar:
-        if episode == 7001:
-            current_opponent = agent2_heuristic
-            agent1.epsilon = 0.3
-            agent1.epsilon_decay = 0.999
+        # [페이즈 전환] 2001판째에 셀프 플레이로 진화
+        if episode == 2001:
+            print("[Self 대결 시작]")
+            agent1_wins = 0 # 승률 통계 리셋
+            agent1.epsilon = 0.2 
+            agent1.epsilon_decay = 0.9995
             
         state, info = env.reset()
         terminated = False
-        episode_memory = []
+        
+        # 흑(주인공)과 백(스파링 파트너)의 기보를 완벽히 분리하여 기록
+        memory_b = [] 
+        memory_w = []
         
         while not terminated:
             current_player = info["current_player"]
             
             if current_player == 1:
+                # [흑돌 = 주인공] 하이브리드 정책으로 착수
                 action = agent1.select_action(state)
-                # 내적 보상 계산 (이전에 추가하신 함수가 있다면 사용, 없다면 0으로 두셔도 무방합니다)
-                step_reward = agent1.get_intrinsic_reward(state, action) if hasattr(agent1, 'get_intrinsic_reward') else 0.0
-                episode_memory.append((state.copy(), action, step_reward))
+                memory_b.append((state.copy(), action, 0.0))
                 
                 next_state, reward, terminated, _, info = env.step(action)
                 state = next_state
             else:
+                # [백돌 = 상대방] 시점을 뒤집어서 착수
                 inverted_state = np.where(state == 1, 2, np.where(state == 2, 1, 0))
-                # 파트너는 agent2의 뇌로 생각해서 둡니다.
-                action = current_opponent.select_action(inverted_state)
+                
+                if episode <= 2000:
+                    action = agent_heur.select_action(inverted_state)  # 1막: 휴리스틱
+                else:
+                    action = agent2_self.select_action(inverted_state) # 2막: 과거의 나
+                    
+                # 적의 훌륭한 수비/공격 위치도 빠짐없이 훔쳐서 기록!
+                memory_w.append((inverted_state.copy(), action, 0.0))
+                
                 next_state, reward, terminated, _, info = env.step(action)
                 state = next_state
 
@@ -577,38 +607,45 @@ def train_main():
         # ==========================================
         winner = info.get("winner")
         if winner == 1:
-            final_reward = 1.0     # 승리
             agent1_wins += 1
+            agent1.memorize_episode(memory_b, 1.0)   # 흑(나)의 승리 비법 저장
+            agent1.memorize_episode(memory_w, -1.0)  # 백(적)의 패인 저장
         elif winner == 2:
-            final_reward = -1.0    # 패배
+            agent1.memorize_episode(memory_b, -1.0)  # 흑(나)의 패인 저장
+            agent1.memorize_episode(memory_w, 1.0)   # 백(적)의 카운터 펀치를 황금 정답으로 훔치기!
         else:
-            final_reward = -1.0    # 무승부 (패배 처리)
+            # 무승부는 쌍방의 공격 실패이므로 약한 페널티 부여
+            agent1.memorize_episode(memory_b, -0.5)
+            agent1.memorize_episode(memory_w, -0.5)
             
-        # agent1만 학습을 진행합니다. (agent2는 맞으면서 데이터만 제공하는 샌드백 역할)
-        agent1.memorize_episode(episode_memory, final_reward)
+        # 모은 기보를 4번씩 섞어가며 ResNet 뇌세포를 정교하게 깎아냅니다.
         for _ in range(4):
             agent1.replay_experience()
 
         # 진행 상황 표시 (메모리에 데이터가 얼마나 쌓였는지도 확인 가능)
-        win_rate = (agent1_wins / episode) * 100
+        phase = "VS 휴리스틱" if episode <= 2000 else "VS 셀프 플레이"
+        current_ep = episode if episode <= 2000 else (episode - 2000)
+        win_rate = (agent1_wins / current_ep) * 100
+
         pbar.set_postfix({
-            "승리": f"{agent1_wins}/{episode} | {win_rate:.2f}%",
+            "모드": phase,
+            "승률": f"{agent1_wins}/{current_ep} ({win_rate:.2f}%)",
             "앱실론": f"{agent1.epsilon:.3f}",
-            "메모리": f"{len(agent1.memory)}" # 뇌 용량이 차오르는 것을 볼 수 있습니다
+            "메모리": f"{len(agent1.memory)}"
         })
         
-        # 탐험률 감소
+        # 매 판이 끝날 때마다 조금씩 진지해집니다 (랜덤 착수 감소)
         agent1.decay_epsilon()
-        
-        # 1000판마다 중간 저장
+            
+        # 1000판마다 뇌를 안전하게 백업
         if episode % 1000 == 0:
             agent1.save_model(f"khy_omok_model_ep{episode}.pth")
-            if episode <= 7000:
-                agent2.model.load_state_dict(agent1.model.state_dict())
-                agent1.epsilon = 0.3
-                agent1.epsilon_decay = 0.9982
+            # 셀프 플레이 기간(2000판 이후)
+            if episode >= 2000:
+                agent1.epsilon = 0.2  # 새로운 상대를 만났으니 다시 탐험 시작
+                agent2_self.model.load_state_dict(agent1.model.state_dict())
             
-    # 전체 학습 종료 후 최종 뇌 구조 저장
+    # 전체 종료
     agent1.save_model("khy_omok_model_final.pth")
     print("\n=== 1만 판의 수읽기 완료 ===")
     env.close()
