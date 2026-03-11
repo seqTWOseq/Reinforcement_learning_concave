@@ -352,7 +352,6 @@ class KhyAgent:
                 if urgent_move is not None:
                     sim_action = urgent_move
                 else:
-                    # 무거운 파이썬 난수 탐색 대신, 초고속 C++ 기반 CNN 가이드 부활!
                     # (빨리 승패를 결정지어 10수 루프를 조기 종료시킵니다)
                     sim_tensor = torch.FloatTensor(eval_state).to(self.device)
                     self.model.eval()
@@ -592,7 +591,7 @@ def main():
     model = OmokCNN()
     agent1 = KhyAgent(model)
     
-    agent1.load_model("khy_omok_model_gen2_final.pth")
+    agent1.load_model("khy_omok_model_ep3000.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -859,5 +858,5 @@ def train_main():
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    # main()
-    train_main()
+    main()
+    # train_main()
