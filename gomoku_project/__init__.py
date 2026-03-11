@@ -1,0 +1,2 @@
+"""Modular Gomoku project package."""
+
