@@ -3,6 +3,7 @@ from gymnasium import spaces
 import tkinter as tk
 
 import numpy as np
+from numba import njit
 import random
 from collections import deque
 import torch
@@ -241,6 +242,125 @@ class HeuristicAgent:
                     score += 0.0001 # 열린 2목 (초반 자리 선점)
                 
         return score
+
+@njit
+def check_pattern_fast(state, r, c, player, target, open_ends_req):
+    """C언어 속도로 동작하는 패턴 확인 함수"""
+    directions = np.array([[0, 1], [1, 0], [1, 1], [-1, 1]])
+    board_size = state.shape[0]
+
+    for d in range(4):
+        dr = directions[d, 0]
+        dc = directions[d, 1]
+        consecutive = 1
+        open_ends = 0
+
+        for step in (1, -1):
+            nr = r + dr * step
+            nc = c + dc * step
+            while 0 <= nr < board_size and 0 <= nc < board_size:
+                if state[nr, nc] == player:
+                    consecutive += 1
+                elif state[nr, nc] == 0:
+                    open_ends += 1
+                    break
+                else:
+                    break
+                nr += dr * step
+                nc += dc * step
+        
+        if consecutive >= target and open_ends >= open_ends_req:
+            return True
+    return False
+
+@njit
+def find_urgent_move_fast(state, valid_moves, player):
+    """C언어 속도로 동작하는 위급 수 탐색 함수 (Numba는 None을 쓸 수 없어 -1 반환)"""
+    board_size = state.shape[0]
+    opponent = 3 - player
+    best_move = -1
+    best_priority = 5
+
+    for i in range(len(valid_moves)):
+        move = valid_moves[i]
+        r = move // board_size
+        c = move % board_size
+        
+        # 1순위: 승리 확정
+        if check_pattern_fast(state, r, c, player, 5, 0):
+            return move
+        
+        # 2순위: 상대 승리 방어
+        if best_priority > 2 and check_pattern_fast(state, r, c, opponent, 5, 0):
+            best_move = move
+            best_priority = 2
+            continue
+        
+        # 3순위: 상대 양수겸장 차단
+        if best_priority > 3:
+            threat_count = 0
+            if check_pattern_fast(state, r, c, opponent, 4, 0): threat_count += 1
+            if check_pattern_fast(state, r, c, opponent, 3, 2): threat_count += 1
+            if threat_count >= 2:
+                best_move = move
+                best_priority = 3
+                continue
+        
+        # 4순위: 상대 열린 4목 방어
+        if best_priority > 4 and check_pattern_fast(state, r, c, opponent, 4, 2):
+            best_move = move
+            best_priority = 4
+
+    return best_move
+
+@njit
+def fast_rollout_fast(state, action, max_depth, max_moves=50):
+    """C언어 속도로 동작하는 MCTS 시뮬레이션 엔진 (50수 제한 룰 추가)"""
+    board_size = state.shape[0]
+    sim_state = state.copy()
+    r = action // board_size
+    c = action % board_size
+    sim_state[r, c] = 1 
+    
+    # 1. 현재 보드판에 놓인 전체 돌의 개수 카운트
+    current_stones = 0
+    for i in range(board_size):
+        for j in range(board_size):
+            if sim_state[i, j] != 0:
+                current_stones += 1
+                
+    # 내가 방금 둔 수로 승리했는지 확인
+    if check_pattern_fast(sim_state, r, c, 1, 5, 0):
+        return 1.0 
+        
+    current_player = 2
+    for _ in range(max_depth):
+        # 핵심: 현재 돌의 개수가 max_moves(50수)에 도달하면 무조건 무승부(-0.5) 처리
+        if current_stones >= max_moves:
+            return -0.5
+            
+        valid_moves = np.where(sim_state.flatten() == 0)[0]
+        if len(valid_moves) == 0:
+            break 
+            
+        urgent_move = find_urgent_move_fast(sim_state, valid_moves, current_player)
+        
+        if urgent_move != -1:
+            sim_action = urgent_move
+        else:
+            sim_action = np.random.choice(valid_moves)
+            
+        sr = sim_action // board_size
+        sc = sim_action % board_size
+        sim_state[sr, sc] = current_player
+        current_stones += 1 # 돌이 놓일 때마다 카운트 증가
+        
+        if check_pattern_fast(sim_state, sr, sc, current_player, 5, 0):
+            return 1.0 if current_player == 1 else -1.0 
+            
+        current_player = 3 - current_player
+        
+    return 0.0  
     
 class KhyAgent:
     def __init__(self, model):
@@ -262,7 +382,7 @@ class KhyAgent:
     # 행동 선택 로직
     def select_action(self, state):
         board_size = state.shape[0]
-        total_grids = board_size * board_size # 하드코딩 제거 (동적 할당)
+        total_grids = board_size * board_size 
         
         raw_valid_moves = np.where(state.flatten() == 0)[0]
         if len(raw_valid_moves) == 0:
@@ -270,7 +390,7 @@ class KhyAgent:
         
         occupied = np.argwhere(state != 0)
         if len(occupied) == 0:
-            return (board_size // 2) * board_size + (board_size // 2) # 천원 착수
+            return (board_size // 2) * board_size + (board_size // 2) 
         
         # 인접 빈칸 탐색
         sensible_moves = set()
@@ -282,16 +402,15 @@ class KhyAgent:
                         sensible_moves.add(nr * board_size + nc)
         valid_moves = np.array(list(sensible_moves))
             
-        # 위급 수 우선 확인
-        urgent_move = self._find_urgent_move(state, valid_moves, player=1)
-        if urgent_move is not None:
+        # 위급 수 우선 확인 (Numba 함수 호출)
+        urgent_move = find_urgent_move_fast(state, valid_moves, player=1)
+        if urgent_move != -1: # None 대신 -1로 체크
             return urgent_move
 
         # CNN 가치 및 정책 평가
         state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         self.model.eval()
         with torch.no_grad():
-            # 듀얼 헤드의 두 가지 출력값을 분리해서 받음
             policy_logits, value = self.model(state_tensor)
             policy_logits = policy_logits.squeeze()
         self.model.train()
@@ -301,11 +420,11 @@ class KhyAgent:
         valid_mask[valid_moves] = False
         policy_logits[valid_mask] = -float('inf')
 
-        # Softmax를 적용해 모델이 제안하는 '행동 확률 분포(Policy)' 획득
+        # Softmax를 적용해 행동 확률 분포 획득
         policy_probs = F.softmax(policy_logits, dim=0).cpu().numpy()
 
         # MCTS 시뮬레이션
-        num_simulations = 50
+        num_simulations = 100
         action_visits = np.zeros(total_grids)
         action_wins = np.zeros(total_grids)
 
@@ -313,55 +432,25 @@ class KhyAgent:
             if np.random.rand() <= self.epsilon:
                 sim_action = np.random.choice(valid_moves)
             else:
-                # Value가 아닌 Policy(신경망의 직관)를 기반으로 후보 수 좁히기
                 probs = policy_probs[valid_moves]
-                probs = probs / np.sum(probs) # 확률 정규화
+                probs = probs / np.sum(probs)
                 sim_action = np.random.choice(valid_moves, p=probs)
             
-            reward = self._fast_rollout(state, sim_action, max_depth=5)
+            # Numba로 최적화된 빠른 롤아웃 함수 호출
+            reward = fast_rollout_fast(state, sim_action, max_depth=5)
             action_visits[sim_action] += 1
             action_wins[sim_action] += reward
         
         sim_q_values = np.divide(action_wins, action_visits, out=np.zeros_like(action_wins), where=action_visits!=0)
         
-        # Policy(직관)와 Rollout Value(수읽기 승률)를 결합하여 최종 판단
+        # Policy와 Rollout Value 결합
         alpha = 0.5
         final_score = np.where(action_visits > 0, (alpha * policy_probs) + ((1 - alpha) * sim_q_values), policy_probs)
         final_score[~np.isin(np.arange(total_grids), valid_moves)] = -float('inf')
 
         return np.argmax(final_score)
     
-    # 시뮬레이션 엔진
-    def _fast_rollout(self, state, action, max_depth=5):
-        board_size = state.shape[0]
-        sim_state = state.copy()
-        r, c = action // board_size, action % board_size
-        sim_state[r, c] = 1 
-        
-        if self._check_pattern(sim_state, r, c, player=1, target=5):
-            return 1.0 
-            
-        current_player = 2
-        for _ in range(max_depth):
-            valid_moves = np.where(sim_state.flatten() == 0)[0]
-            if len(valid_moves) == 0:
-                break 
-                
-            # 배열 복사 없이 플레이어 식별자만 전달하여 속도 최적화
-            urgent_move = self._find_urgent_move(sim_state, valid_moves, player=current_player)
-            sim_action = urgent_move if urgent_move is not None else np.random.choice(valid_moves)
-                
-            sr, sc = sim_action // board_size, sim_action % board_size
-            sim_state[sr, sc] = current_player
-            
-            if self._check_pattern(sim_state, sr, sc, current_player, target=5):
-                return 1.0 if current_player == 1 else -1.0 
-                
-            current_player = 3 - current_player
-            
-        return 0.0
-    
-    # 내재적 보상 (공격 포메이션 평가)
+    # 내재적 보상 (공격 포메이션 평가) - 이 부분은 Numba 외부로 남겨두었습니다. 필요시 통합 가능.
     def get_intrinsic_reward(self, state, action):
         board_size = state.shape[0]
         r, c = action // board_size, action % board_size
@@ -399,80 +488,36 @@ class KhyAgent:
                 pattern_counts['open_3'] += 1
         
         if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
-            reward += 0.8
+            reward += 1.5
             
         return reward
     
-    # 무조건 해야 되는 행동 하드코딩
-    def _find_urgent_move(self, state, valid_moves, player):
-        board_size = state.shape[0]
-        opponent = 3 - player
-        best_move = None
-        best_priority = 5 # 낮을수록 높음
-
-        # 단일 루프로 탐색 최적화
-        for move in valid_moves:
-            r, c = move // board_size, move % board_size
-            
-            # 1순위: 승리 확정
-            if self._check_pattern(state, r, c, player=player, target=5):
-                return move
-            
-            # 2순위: 상대 승리 방어
-            if best_priority > 2 and self._check_pattern(state, r, c, player=opponent, target=5):
-                best_move = move
-                best_priority = 2
-                continue
-            
-            # 3순위: 상대 양수겸장 차단
-            if best_priority > 3:
-                threat_count = 0
-                if self._check_pattern(state, r, c, player=opponent, target=4): threat_count += 1
-                if self._check_pattern(state, r, c, player=opponent, target=3, open_ends_req=2): threat_count += 1
-                if threat_count >= 2:
-                    best_move = move
-                    best_priority = 3
-                    continue
-            
-            # 4순위: 상대 열린 4목 방어
-            if best_priority > 4 and self._check_pattern(state, r, c, player=opponent, target=4, open_ends_req=2):
-                best_move = move
-                best_priority = 4
-
-        return best_move
-    
-    # 패턴 파악
-    def _check_pattern(self, state, r, c, player, target, open_ends_req=0):
-        directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
-        board_size = state.shape[0]
-
-        for dr, dc in directions:
-            consecutive = 1
-            open_ends = 0
-
-            for step in (1, -1):
-                nr, nc = r + dr * step, c + dc * step
-                while 0 <= nr < board_size and 0 <= nc < board_size:
-                    if state[nr, nc] == player:
-                        consecutive += 1
-                    elif state[nr, nc] == 0:
-                        open_ends += 1
-                        break 
-                    else:
-                        break 
-                    nr += dr * step
-                    nc += dc * step
-            
-            if consecutive >= target and open_ends >= open_ends_req:
-                return True
-        return False
-    
-    # 기억 장치
+    # 기억 장치 (데이터 증강 적용)
     def memorize_episode(self, episode_memory, final_reward):
         discounted_reward = final_reward 
+        
         for state, action, step_reward in reversed(episode_memory):
             total_reward = step_reward + discounted_reward
-            self.memory.append((state, action, total_reward))
+            board_size = state.shape[0]
+            
+            # 행동(Action)을 2D 배열 위치로 표현 (보드판과 동일한 회전/반전을 적용하기 위함)
+            action_matrix = np.zeros((board_size, board_size), dtype=np.int8)
+            action_matrix[action // board_size, action % board_size] = 1
+            
+            # 8방향 대칭(Symmetry) 데이터 생성
+            for i in range(4):
+                # 1. 0, 90, 180, 270도 회전
+                rot_state = np.rot90(state, k=i)
+                rot_action_mat = np.rot90(action_matrix, k=i)
+                rot_action = np.argmax(rot_action_mat) # 1이 있는 위치의 1D 인덱스 추출
+                self.memory.append((rot_state.copy(), rot_action, total_reward))
+                
+                # 2. 회전된 상태에서 좌우 반전(Flip)
+                flip_state = np.fliplr(rot_state)
+                flip_action_mat = np.fliplr(rot_action_mat)
+                flip_action = np.argmax(flip_action_mat)
+                self.memory.append((flip_state.copy(), flip_action, total_reward))
+                
             discounted_reward *= self.gamma
     
     # 복습 엔진
@@ -483,24 +528,16 @@ class KhyAgent:
         minibatch = random.sample(self.memory, self.batch_size)
         states, actions, targets = zip(*minibatch)
 
-        # 채널 차원(unsqueeze(1)) 추가로 Conv2d 에러 방지
         states_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(self.device)
-        actions_tensor = torch.LongTensor(actions).to(self.device) # Policy 정답: (Batch,) 유지
-        targets_tensor = torch.FloatTensor(targets).unsqueeze(1).to(self.device) # Value 정답: (Batch, 1)로 변환
+        actions_tensor = torch.LongTensor(actions).to(self.device) 
+        targets_tensor = torch.FloatTensor(targets).unsqueeze(1).to(self.device) 
 
-        # 듀얼 헤드 추론
         policy_logits, values = self.model(states_tensor)
         
-        # Value Loss (MSE): 현재 판세의 승률 예측 오차
         value_loss = F.mse_loss(values, targets_tensor)
-
-        # Policy Loss (Cross-Entropy): 내가 실제로 둔 좋은 수를 모델도 높은 확률로 추천했는가?
         policy_loss = F.cross_entropy(policy_logits, actions_tensor)
-
-        # Total Loss: 두 오차의 합산
         total_loss = value_loss + policy_loss
 
-        # 역전파 및 가중치 업데이트
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
@@ -522,7 +559,7 @@ class KhyAgent:
     def decay_epsilon(self):
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-
+            
 # ==========================================
 # 3. 대결 실행 루프 (Arena)
 # ==========================================
@@ -533,6 +570,7 @@ def main():
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
+    agent1.load_model("khy_omok_gen1_ep1000.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -591,25 +629,29 @@ def train_main():
     for gen in range(1, N + 1):
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
-        # 1막 초기화
-        agent1.epsilon, agent1.epsilon_decay = 0.01, 0.998
         agent1_wins, total_phase_steps = 0, 0
         pbar = None
         
         for episode in range(1, EPISODES + 1):
-            # --- 막(Phase) 전환 논리 ---
+            # --- 4단계 막(Phase) 전환 커리큘럼 ---
             if episode == 1:
-                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 1막 VS 휴", position=0, leave=True)
+                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 1막 VS 셀프", position=0, leave=True)
+                agent1.epsilon, agent1.epsilon_decay = 0.7, 0.998 # 백지상태이므로 탐험률 높게 시작
             elif episode == 2001:
                 pbar.close()
                 agent1_wins, total_phase_steps = 0, 0
-                agent1.epsilon, agent1.epsilon_decay = 0.2, 0.999
-                pbar = tqdm(total=6000, desc=f"[Gen {gen}] 2막 VS 셀프", position=0, leave=True)
+                agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 # 휴리스틱 상대로 적절한 탐험
+                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 2막 VS 휴리스틱", position=0, leave=True)
+            elif episode == 4001:
+                pbar.close()
+                agent1_wins, total_phase_steps = 0, 0
+                agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998 # 배운 것을 바탕으로 셀프 심화 학습
+                pbar = tqdm(total=4000, desc=f"[Gen {gen}] 3막 VS 셀프 (심화)", position=0, leave=True)
             elif episode == 8001:
                 pbar.close()
                 agent1_wins, total_phase_steps = 0, 0
-                agent1.epsilon, agent1.epsilon_decay = 0.0, 1.0 
-                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 3막 VS 휴", position=0, leave=True)
+                agent1.epsilon, agent1.epsilon_decay = 0.0, 1.0 # 탐험 없이 실력 검증
+                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 4막 VS 휴리스틱 (검증)", position=0, leave=True)
                 
             state, info = env.reset()
             terminated = False
@@ -620,6 +662,12 @@ def train_main():
             while not terminated:
                 current_player = info["current_player"]
                 
+                # 60수 제한 강제 패배 로직 추가
+                if current_episode_steps >= 50:
+                    terminated = True
+                    info["winner"] = 0 # 50수 초과 시 무조건 흑(agent1) 패배 처리
+                    break # 게임 루프 탈출
+                
                 if current_player == 1:
                     action = agent1.select_action(state)
                     step_reward = agent1.get_intrinsic_reward(state, action)
@@ -627,13 +675,13 @@ def train_main():
                     next_state, reward, terminated, _, info = env.step(action)
                     state = next_state
                 else:
-                    # 속도 최적화: 수식을 이용한 상태 반전 (1->2, 2->1)
                     inverted_state = np.where(state != 0, 3 - state, 0)
                     
-                    if episode <= 2000 or episode >= 8001:
-                        action = agent_heur.select_action(inverted_state) 
-                    else:
+                    # 커리큘럼에 따른 상대방 선택 로직
+                    if (1 <= episode <= 2000) or (4001 <= episode <= 8000):
                         action = agent2_self.select_action(inverted_state) 
+                    else:
+                        action = agent_heur.select_action(inverted_state) 
                         
                     step_reward = agent1.get_intrinsic_reward(inverted_state, action)
                     memory_w.append((inverted_state.copy(), action, step_reward))
@@ -642,7 +690,6 @@ def train_main():
                     
                 current_episode_steps += 1 
             
-            # 논리 오류 수정: 총 스텝 수는 게임이 끝난 후 한 번만 더함
             total_phase_steps += current_episode_steps
 
             # --- 게임 종료 후: 승패 기록 및 복습 ---
@@ -662,12 +709,20 @@ def train_main():
                 agent1.replay_experience()
 
             # --- 통계 계산 및 진행바 업데이트 ---
-            current_ep = episode if episode <= 2000 else (episode - 2000 if episode <= 8000 else episode - 8000)
+            if episode <= 2000:
+                current_ep = episode
+            elif episode <= 4000:
+                current_ep = episode - 2000
+            elif episode <= 8000:
+                current_ep = episode - 4000
+            else:
+                current_ep = episode - 8000
+                
             win_rate = (agent1_wins / current_ep) * 100
             avg_steps = total_phase_steps // current_ep
 
             pbar.set_postfix({
-                "승률": f"{agent1_wins}/{current_ep} ({win_rate:.2f}%)",
+                "승률": f"{agent1_wins}/{current_ep} ({win_rate:.1f}%)",
                 "현재": f"{current_episode_steps}수",
                 "평균": f"{avg_steps}수",
                 "입실론": f"{agent1.epsilon:.3f}",
@@ -680,16 +735,15 @@ def train_main():
 
             # --- 체크포인트 저장 및 셀프 플레이 갱신 ---
             if episode % 1000 == 0:
-                agent1.save_model(f"khy_omok_gen{gen}_ep{episode}.pth") # 세대 변수 추가
-                if 2000 <= episode < 8000:
-                    agent1.epsilon = 0.2  
+                agent1.save_model(f"khy_omok_ep{episode}.pth")
+                # 셀프 플레이 구간에서는 1000판마다 상대방(과거의 나) 업데이트
+                if (1 <= episode < 2000) or (4000 <= episode < 8000):
                     agent2_self.model.load_state_dict(agent1.model.state_dict())
                 
         if pbar is not None:
             pbar.close()
         
-        # 덮어쓰기 방지: 세대별 최종 모델 분리 저장
-        agent1.save_model(f"khy_omok_gen{gen}_final.pth")
+        agent1.save_model(f"khy_omok_final.pth")
         
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
     env.close()
