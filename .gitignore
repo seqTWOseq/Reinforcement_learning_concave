@@ -1,0 +1,4 @@
+__pycache__/
+checkpoints/
+opponent_pool/
+omok_model.zip

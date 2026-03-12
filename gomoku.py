@@ -153,16 +153,74 @@ class Agent1:
         return np.random.choice(valid) if len(valid) > 0 else 0
 
 class Agent2:
-    """중앙(7, 7)과 가장 가까운 빈칸에 착수하는 에이전트"""
-    def __init__(self, name="Center_White(○)"): self.name = name
+    """
+    학습된 PPO 모델을 불러와 최적의 행동을 예측하는 에이전트.
+
+    [인터페이스 호환]
+    main()에서 agent2는 흑/백 색상이 반전된 inverted_state를 받습니다.
+    학습 시에도 에이전트는 항상 자신을 Player 1로 인식하므로 일관성이 유지됩니다.
+
+    [폴백 정책]
+    omok_model.zip 파일이 없으면 경고 출력 후 랜덤 에이전트로 동작합니다.
+    train.py를 실행하여 모델을 생성하세요.
+    """
+
+    def __init__(self, model_path="omok_model.zip", name="PPO_White(○)"):
+        self.name = name
+        self.model = None
+
+        try:
+            # MaskablePPO 우선 시도, 없으면 일반 PPO로 폴백
+            try:
+                from sb3_contrib import MaskablePPO as _PPO
+            except ImportError:
+                from stable_baselines3 import PPO as _PPO
+            self.model = _PPO.load(model_path)
+            print(f"[{self.name}] 모델 로드 성공: {model_path}")
+        except FileNotFoundError:
+            print(f"[{self.name}] 경고: '{model_path}' 없음 → 랜덤 에이전트로 대체됩니다.")
+            print(f"[{self.name}]  → train.py 를 먼저 실행하여 모델을 학습시키세요.")
+        except Exception as e:
+            print(f"[{self.name}] 모델 로드 실패: {e} → 랜덤 에이전트로 대체됩니다.")
+
     def select_action(self, state):
-        board_size, center = state.shape[0], state.shape[0] // 2
-        valid = np.where(state.flatten() == 0)[0]
-        if len(valid) == 0: return 0
-        
-        # 맨해튼 거리가 가장 짧은 액션 선택
-        best_action = min(valid, key=lambda a: abs(a // board_size - center) + abs(a % board_size - center))
-        return best_action
+        """
+        state: 2D numpy 배열 (15x15), 반전된 뷰 (자신=1, 상대=2)
+        학습 시 CNN 입력 형식 (3,15,15)으로 변환 후 predict.
+        """
+        obs_flat = state.flatten()
+        valid = np.where(obs_flat == 0)[0]
+        if len(valid) == 0:
+            return 0
+
+        if self.model is None:
+            return int(np.random.choice(valid))
+
+        # 학습과 동일한 CNN 입력: (3, 15, 15) 이진 채널
+        obs_cnn = np.stack([
+            (state == 1).astype(np.float32),   # Ch0: 내 돌
+            (state == 2).astype(np.float32),   # Ch1: 상대 돌
+            (state == 0).astype(np.float32),   # Ch2: 빈칸
+        ], axis=0)
+
+        # Action Masking: 빈칸만 True
+        valid_mask = (obs_flat == 0)
+
+        try:
+            action, _ = self.model.predict(obs_cnn, deterministic=True, action_masks=valid_mask)
+        except TypeError:
+            # 일반 PPO 폴백 (action_masks 미지원)
+            action, _ = self.model.predict(obs_cnn, deterministic=True)
+        action = int(action)
+
+        # 유효하지 않은 수 예측 시 경고 + 랜덤 폴백
+        if obs_flat[action] != 0:
+            print(f"[{self.name}] ⚠️  유효하지 않은 수({action}) 예측 → 랜덤 폴백")
+            action = int(np.random.choice(valid))
+        else:
+            print(f"[{self.name}] ✓  착수: {action} (행={action // 15}, 열={action % 15})")
+
+        return action
 
 # ==========================================
 # 3. 대결 실행 루프 (Arena)
@@ -194,7 +252,7 @@ def main():
     print("\n=== 🏁 대결 종료 ===")
     winner = info.get("winner")
     if winner == 1: print(f"🎉 {agent1.name} 승리!")
-    elif winner == 2: print(f"🎉 {agent2.name} 승리! (중앙 선호 전략)")
+    elif winner == 2: print(f"🎉 {agent2.name} 승리!")
     else: print("🤝 무승부!")
         
     time.sleep(3)
