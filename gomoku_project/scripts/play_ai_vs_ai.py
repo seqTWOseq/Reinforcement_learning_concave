@@ -11,9 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from gomoku_project.arena.match_runner import run_match
 from gomoku_project.arena.training_match import MatchParticipant, run_training_match
 from gomoku_project.envs.gomoku_env import GomokuEnv
-from gomoku_project.players.center_player import CenterPlayer
 from gomoku_project.players.heuristic_player import HeuristicPlayer
-from gomoku_project.players.random_player import RandomPlayer
 from gomoku_project.rl.ppo_trainer import PPOTrainer
 from gomoku_project.rl.trainer import AlphaZeroTrainer
 from gomoku_project.ui.tkinter_renderer import TkinterRenderer
@@ -25,10 +23,6 @@ def _format_optional(value: float | None) -> str:
 
 
 def _build_player(kind: str, name: str, args: argparse.Namespace):
-    if kind == "random":
-        return RandomPlayer(name=name), None, None, None
-    if kind == "center":
-        return CenterPlayer(name=name), None, None, None
     if kind == "heuristic":
         return HeuristicPlayer(name=name), None, None, None
     if kind == "ppo":
@@ -80,8 +74,8 @@ def main() -> None:
         description="Play Gomoku: AI vs AI. Training is disabled unless --train-after-game is set.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--black", choices=("random", "center", "heuristic", "ppo", "alphazero"), default="random")
-    parser.add_argument("--white", choices=("random", "center", "heuristic", "ppo", "alphazero"), default="center")
+    parser.add_argument("--black", choices=("heuristic", "ppo", "alphazero"), default="heuristic")
+    parser.add_argument("--white", choices=("heuristic", "ppo", "alphazero"), default="alphazero")
     parser.add_argument(
         "--alphazero-model-path",
         type=str,

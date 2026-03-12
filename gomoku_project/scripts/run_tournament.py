@@ -10,9 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gomoku_project.arena.tournament import run_round_robin_tournament
-from gomoku_project.players.center_player import CenterPlayer
 from gomoku_project.players.heuristic_player import HeuristicPlayer
-from gomoku_project.players.random_player import RandomPlayer
 from gomoku_project.rl.ppo_trainer import PPOTrainer
 from gomoku_project.rl.trainer import AlphaZeroTrainer
 from gomoku_project.utils.checkpoint_utils import load_checkpoint_or_maybe_warn
@@ -20,8 +18,6 @@ from gomoku_project.utils.checkpoint_utils import load_checkpoint_or_maybe_warn
 
 def _display_name(kind: str) -> str:
     return {
-        "random": "Random",
-        "center": "Center",
         "heuristic": "Heuristic",
         "ppo": "PPO",
         "alphazero": "AlphaZero",
@@ -29,10 +25,6 @@ def _display_name(kind: str) -> str:
 
 
 def _build_player(kind: str, name: str, args: argparse.Namespace):
-    if kind == "random":
-        return RandomPlayer(name=name), None
-    if kind == "center":
-        return CenterPlayer(name=name), None
     if kind == "heuristic":
         return HeuristicPlayer(name=name), None
     if kind == "ppo":
@@ -69,8 +61,8 @@ def main() -> None:
     parser.add_argument(
         "--players",
         nargs="+",
-        choices=("random", "center", "heuristic", "ppo", "alphazero"),
-        default=["random", "heuristic", "ppo", "alphazero", "center"],
+        choices=("heuristic", "ppo", "alphazero"),
+        default=["heuristic", "ppo", "alphazero"],
         help="Player pool for the round-robin tournament.",
     )
     parser.add_argument(

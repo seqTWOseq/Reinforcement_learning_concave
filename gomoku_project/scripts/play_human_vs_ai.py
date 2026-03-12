@@ -12,7 +12,6 @@ from gomoku_project.arena.match_runner import run_match
 from gomoku_project.arena.training_match import MatchParticipant, run_training_match
 from gomoku_project.core.constants import BLACK, WHITE
 from gomoku_project.envs.gomoku_env import GomokuEnv
-from gomoku_project.players.center_player import CenterPlayer
 from gomoku_project.players.heuristic_player import HeuristicPlayer
 from gomoku_project.players.human_player import HumanPlayer
 from gomoku_project.rl.ppo_trainer import PPOTrainer
@@ -49,7 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--opponent",
-        choices=("alphazero", "rl", "ppo", "heuristic", "center"),
+        choices=("alphazero", "rl", "ppo", "heuristic"),
         default="alphazero",
         help="'rl' is kept as a legacy alias for 'alphazero'.",
     )
@@ -205,7 +204,7 @@ def _build_ai_player(args: argparse.Namespace):
     if args.opponent == "heuristic":
         return HeuristicPlayer(name="Heuristic"), None, None, args.opponent
 
-    return CenterPlayer(name="Center"), None, None, args.opponent
+    raise ValueError(f"Unsupported opponent kind: {args.opponent}")
 
 
 def main() -> None:
