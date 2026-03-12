@@ -3,6 +3,7 @@ from gymnasium import spaces
 import tkinter as tk
 
 import numpy as np
+from numba import njit
 import random
 from collections import deque
 import torch
@@ -270,143 +271,114 @@ class KhyAgent:
         if len(occupied) == 0:
             # 첫 수는 무조건 바둑판의 정중앙(천원)에 착수!
             return (board_size // 2) * board_size + (board_size // 2)
-        else:
-            # 기존 돌들 주변 반경 2칸 이내만 탐색 후보로 선정
-            sensible_moves = set()
-            for r, c in occupied:
-                for dr in range(-2, 3):
-                    for dc in range(-2, 3):
-                        nr, nc = r + dr, c + dc
-                        if 0 <= nr < board_size and 0 <= nc < board_size and state[nr, nc] == 0:
-                            sensible_moves.add(nr * board_size + nc)
-            # 좁혀진 후보군을 valid_moves로 확정
-            valid_moves = np.array(list(sensible_moves))
+        
+        sensible_moves = set()
+        for r, c in occupied:
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < board_size and 0 <= nc < board_size and state[nr, nc] == 0:
+                        sensible_moves.add(nr * board_size + nc)
+        valid_moves = np.array(list(sensible_moves))
             
         urgent_move = self._find_urgent_move(state, valid_moves)
         if urgent_move is not None:
             return urgent_move
 
-        # 탐험 (Epsilon)
-        if np.random.rand() <= self.epsilon:
-            return np.random.choice(valid_moves)
-        
-        # CNN을 통해 모든 칸의 가치(Q-Value) 초기 평가
-        state_tensor = torch.FloatTensor(state).to(self.device)
+        # CNN을 통한 초기 가치(Q-Value) 계산
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device) # Batch 차원 추가
         self.model.eval()
         with torch.no_grad():
-            q_values = self.model(state_tensor).squeeze()
+            raw_q_values = self.model(state_tensor).squeeze()
         self.model.train()
 
-        # 불가능한 수 마스킹 (-무한대)
-        mask = torch.ones(225, dtype=torch.bool).to(self.device)
-        mask[valid_moves] = False
-        q_values[mask] = -float('inf')
+        # 불가능한 수 마스킹
+        valid_mask = torch.ones(225, dtype=torch.bool).to(self.device)
+        valid_mask[valid_moves] = False
+        raw_q_values[valid_mask] = -float('inf')
 
-        # 가장 점수가 높은 K의 수
-        K = min(3, len(valid_moves))
-        top_k_actions = torch.topk(q_values, K).indices.cpu().numpy()
+        # 수정: CNN 출력을 -1.0 ~ 1.0 사이로 강제 정규화 (스케일 통일)
+        # (변수명도 논리에 맞게 p_table -> q_table로 변경했습니다)
+        q_table = np.tanh(raw_q_values.cpu().numpy())
 
-        best_action = top_k_actions[0]
-        best_q_value = -float('inf')
+        # 몬테카를로 시뮬레이션
+        num_simulations = 50
+        action_visits = np.zeros(225)
+        action_wins = np.zeros(225)
 
-        # Top-10 후보들을 각각 50번씩 가상 대국 돌려보기
-        for action in top_k_actions:
-            # 시뮬레이션을 통해 진짜 승률(Q값)을 계산
-            simulated_q = self._simulate_rollouts(state, action, num_rollouts=5, max_depth=5)
-            my_initial_q = q_values[action].item()
-            final_score = (simulated_q * 0.5) + (my_initial_q * 0.5)
+        for _ in range(num_simulations):
+            # Q-Table 확률을 기반으로 첫 수 선택
+            if np.random.rand() <= self.epsilon:
+                sim_action = np.random.choice(valid_moves)
+            else:
+                # 수정: 오버플로우 방지 (최댓값을 빼주어 수학적 안정성 확보)
+                valid_q_vals = q_table[valid_moves]
+                shifted_q = valid_q_vals - np.max(valid_q_vals)
+                exp_q = np.exp(shifted_q)
+                probs = exp_q / np.sum(exp_q)
+                
+                sim_action = np.random.choice(valid_moves, p=probs)
             
-            # 가장 가치가 높은 수를 최종 선택
-            if final_score > best_q_value:
-                best_q_value = final_score
-                best_action = action
+            # 선택된 첫 수로 빠르고 가벼운 롤아웃 진행 (CNN 미사용)
+            reward = self._fast_rollout(state, sim_action, max_depth=5)
+            
+            action_visits[sim_action] += 1
+            action_wins[sim_action] += reward
+        
+        # 최종 Q-Table 업데이트 (방문하지 않은 곳은 0)
+        sim_q_values = np.divide(action_wins, action_visits, out=np.zeros_like(action_wins), where=action_visits!=0)
+        
+        # CNN 직관(0.3) + 시뮬레이션 검증결과(0.7) 결합
+        # 이제 둘 다 -1.0 ~ 1.0의 스케일을 가지므로 완벽하게 결합됩니다.
+        alpha = 0.3
+        final_q_table = (alpha * q_table) + ((1 - alpha) * sim_q_values)
 
+        # 탐색 범위를 벗어난 무의미한 수는 선택되지 않게 배제
+        final_q_table[~np.isin(np.arange(225), valid_moves)] = -float('inf')
+
+        # 최종적으로 가장 기댓값이 높은 수 반환
+        best_action = np.argmax(final_q_table)
         return best_action
     
-    # 시뮬레이트
-    def _simulate_rollouts(self, state, action, num_rollouts=5, max_depth=5):
+    # 가벼운 시뮬레이션 엔진 (CNN 완전 배제, 속도 극대화)
+    def _fast_rollout(self, state, action, max_depth=5):
         board_size = state.shape[0]
-        total_score = 0.0
+        sim_state = state.copy()
+        r, c = action // board_size, action % board_size
+        sim_state[r, c] = 1 # 내(AI)가 먼저 착수
         
-        for _ in range(num_rollouts):
-            sim_state = state.copy()
-            r, c = action // board_size, action % board_size
-            sim_state[r, c] = 1 
+        # 착수하자마자 이겼는지 확인
+        if self._check_pattern(sim_state, r, c, player=1, target=5):
+            return 1.0 # 승리 보상
             
-            current_player = 2 
-            terminated_by_win = False
+        current_player = 2
+        
+        for _ in range(max_depth):
+            # 후보군 산출 (속도를 위해 전체 빈칸 사용, 더 최적화하려면 좁힐 수 있음)
+            valid_moves = np.where(sim_state.flatten() == 0)[0]
+            if len(valid_moves) == 0:
+                break # 무승부
+                
+            # 시뮬레이션용 빠른 방어/공격 로직 적용 (하드코딩 규칙만 사용)
+            eval_state = sim_state if current_player == 1 else np.where(sim_state == 1, 2, np.where(sim_state == 2, 1, 0))
+            urgent_move = self._find_urgent_move(eval_state, valid_moves)
             
-            for _ in range(max_depth):
-                valid_moves = np.where(sim_state.flatten() == 0)[0]
-                if len(valid_moves) == 0:
-                    break
+            if urgent_move is not None:
+                sim_action = urgent_move
+            else:
+                # 위급 상황이 아니면 무작위 수 진행 (순수 몬테카를로)
+                sim_action = np.random.choice(valid_moves)
                 
-                if current_player == 1:
-                    eval_state = sim_state
-                else:
-                    eval_state = np.where(sim_state == 1, 2, np.where(sim_state == 2, 1, 0))
+            sr, sc = sim_action // board_size, sim_action % board_size
+            sim_state[sr, sc] = current_player
+            
+            # 방금 둔 수로 게임이 끝났는지 확인
+            if self._check_pattern(sim_state, sr, sc, current_player, target=5):
+                return 1.0 if current_player == 1 else -1.0 # 내가 이기면 1, 지면 -1
                 
-                # 강력해진 4단계 반사 신경으로 뻔한 수 방어
-                urgent_move = self._find_urgent_move(eval_state, valid_moves)
-                    
-                if urgent_move is not None:
-                    sim_action = urgent_move
-                else:
-                    # (빨리 승패를 결정지어 10수 루프를 조기 종료시킵니다)
-                    sim_tensor = torch.FloatTensor(eval_state).to(self.device)
-                    self.model.eval()
-                    with torch.no_grad():
-                        q_values = self.model(sim_tensor).squeeze()
-                    self.model.train()
-                
-                    valid_mask = torch.ones(225, dtype=torch.bool).to(self.device)
-                    valid_mask[valid_moves] = False
-                    q_values[valid_mask] = -float('inf')
-                    
-                    K = min(3, len(valid_moves))
-                    top_k_indices = torch.topk(q_values, K).indices.cpu().numpy()
-                    
-                    probabilities = [0.5, 0.3, 0.2][:K]
-                    probabilities /= np.sum(probabilities) 
-                    
-                    sim_action = np.random.choice(top_k_indices, p=probabilities)
-        
-                sr, sc = sim_action // board_size, sim_action % board_size
-                sim_state[sr, sc] = current_player
-                
-                # 누군가 이기면 루프 즉시 폭파 (속도 향상의 핵심)
-                if self._check_pattern(sim_state, sr, sc, current_player, target=5):
-                    if current_player == 1:
-                        total_score += 1.0   
-                    else:
-                        total_score -= 1.0   
-                    terminated_by_win = True
-                    break
-                
-                current_player = 3 - current_player
-                
-            # 10수가 끝난 뒤 최종 형세 판단
-            if not terminated_by_win:
-                if current_player == 1:
-                    final_eval_state = sim_state
-                    sign = 1.0 
-                else:
-                    final_eval_state = np.where(sim_state == 1, 2, np.where(sim_state == 2, 1, 0))
-                    sign = -1.0 
-                    
-                sim_tensor = torch.FloatTensor(final_eval_state).to(self.device)
-                self.model.eval()
-                with torch.no_grad():
-                    leaf_q_values = self.model(sim_tensor).squeeze()
-                self.model.train()
-                
-                valid_mask = torch.ones(225, dtype=torch.bool).to(self.device)
-                valid_mask[np.where(final_eval_state.flatten() == 0)[0]] = False
-                leaf_q_values[valid_mask] = -float('inf')
-                
-                total_score += (sign * leaf_q_values.max().item())
-        
-        return total_score / num_rollouts
+            current_player = 3 - current_player
+            
+        return 0.0 # 제한된 깊이 내에 승부가 안 나면 0 (무승부 간주)
     
     # 내재적 보상 (공격 포메이션 평가)
     def get_intrinsic_reward(self, state, action):
@@ -590,8 +562,6 @@ def main():
     
     model = OmokCNN()
     agent1 = KhyAgent(model)
-    
-    agent1.load_model("khy_omok_model_ep3000.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -858,5 +828,5 @@ def train_main():
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    main()
-    # train_main()
+    # main()
+    train_main()
