@@ -570,7 +570,7 @@ def main():
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
-    agent1.load_model("khy_omok_gen1_ep1000.pth")
+    agent1.load_model("khy_omok_gen1_ep2000.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -635,23 +635,23 @@ def train_main():
         for episode in range(1, EPISODES + 1):
             # --- 4단계 막(Phase) 전환 커리큘럼 ---
             if episode == 1:
-                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 1막 VS 셀프", position=0, leave=True)
+                pbar = tqdm(total=10000, desc=f"[Gen {gen}] 1막 VS 셀프", position=0, leave=True)
                 agent1.epsilon, agent1.epsilon_decay = 0.7, 0.998 # 백지상태이므로 탐험률 높게 시작
-            elif episode == 2001:
-                pbar.close()
-                agent1_wins, total_phase_steps = 0, 0
-                agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 # 휴리스틱 상대로 적절한 탐험
-                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 2막 VS 휴리스틱", position=0, leave=True)
-            elif episode == 4001:
-                pbar.close()
-                agent1_wins, total_phase_steps = 0, 0
-                agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998 # 배운 것을 바탕으로 셀프 심화 학습
-                pbar = tqdm(total=4000, desc=f"[Gen {gen}] 3막 VS 셀프 (심화)", position=0, leave=True)
-            elif episode == 8001:
-                pbar.close()
-                agent1_wins, total_phase_steps = 0, 0
-                agent1.epsilon, agent1.epsilon_decay = 0.0, 1.0 # 탐험 없이 실력 검증
-                pbar = tqdm(total=2000, desc=f"[Gen {gen}] 4막 VS 휴리스틱 (검증)", position=0, leave=True)
+            # elif episode == 2001:
+            #     pbar.close()
+            #     agent1_wins, total_phase_steps = 0, 0
+            #     agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 # 휴리스틱 상대로 적절한 탐험
+            #     pbar = tqdm(total=2000, desc=f"[Gen {gen}] 2막 VS 휴리스틱", position=0, leave=True)
+            # elif episode == 4001:
+            #     pbar.close()
+            #     agent1_wins, total_phase_steps = 0, 0
+            #     agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998 # 배운 것을 바탕으로 셀프 심화 학습
+            #     pbar = tqdm(total=4000, desc=f"[Gen {gen}] 3막 VS 셀프 (심화)", position=0, leave=True)
+            # elif episode == 8001:
+            #     pbar.close()
+            #     agent1_wins, total_phase_steps = 0, 0
+            #     agent1.epsilon, agent1.epsilon_decay = 0.0, 1.0 # 탐험 없이 실력 검증
+            #     pbar = tqdm(total=2000, desc=f"[Gen {gen}] 4막 VS 휴리스틱 (검증)", position=0, leave=True)
                 
             state, info = env.reset()
             terminated = False
