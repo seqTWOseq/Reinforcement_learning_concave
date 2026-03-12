@@ -340,6 +340,8 @@ def _capture_learning_step(
                 action=int(action),
                 log_prob=float(action_info.log_prob),
                 value=float(action_info.value),
+                player_id=int(action_info.player_id),
+                heuristic_beta=float(action_info.heuristic_beta),
             )
         )
         return

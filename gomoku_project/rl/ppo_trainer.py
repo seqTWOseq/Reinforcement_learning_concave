@@ -18,14 +18,15 @@ from gomoku_project.core.constants import (
     WHITE,
     WIN_REWARD,
 )
-from gomoku_project.core.utils import action_to_pos, opponent
+from gomoku_project.core.utils import action_to_pos, opponent, orient_board_to_player
 from gomoku_project.envs.gomoku_env import GomokuEnv
-from gomoku_project.players.heuristic_player import HeuristicPlayer, _analyze_move
+from gomoku_project.players.heuristic_player import HeuristicPlayer, _analyze_move, build_heuristic_scores
 from gomoku_project.players.ppo_player import PPOPlayer
 from gomoku_project.rl.ppo_buffer import PPOBuffer
 from gomoku_project.rl.ppo_network import (
     PPOActorCritic,
-    mask_policy_logits,
+    mix_policy_logits_with_prior,
+    normalize_policy_prior_scores,
     observations_to_tensor,
     valid_actions_to_mask,
 )
@@ -41,6 +42,8 @@ class PPORolloutStep:
     action: int
     log_prob: float
     value: float
+    player_id: int
+    heuristic_beta: float
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,8 @@ class _SampledPolicyAction:
     log_prob: float
     value: float
     action_mask: np.ndarray
+    player_id: int
+    heuristic_beta: float
     selected_action_prob: float
     top1_action_prob: float
     top3_action_prob_sum: float
@@ -78,6 +83,11 @@ class PPOTrainer:
         seed: int | None = None,
         opening_ply_cutoff: int = 6,
         center_radius: int = 2,
+        use_heuristic_prior: bool = False,
+        heuristic_prior_beta_start: float = 0.0,
+        heuristic_prior_beta_end: float = 0.0,
+        heuristic_prior_decay_updates: int = 0,
+        heuristic_prior_score_clip: float = 3.0,
     ) -> None:
         self.board_size = board_size
         self.action_space_size = board_size * board_size
@@ -99,6 +109,11 @@ class PPOTrainer:
         self.rng = np.random.default_rng(seed)
         self.opening_ply_cutoff = max(int(opening_ply_cutoff), 1)
         self.center_radius = max(int(center_radius), 0)
+        self.use_heuristic_prior = bool(use_heuristic_prior)
+        self.heuristic_prior_beta_start = max(float(heuristic_prior_beta_start), 0.0)
+        self.heuristic_prior_beta_end = max(float(heuristic_prior_beta_end), 0.0)
+        self.heuristic_prior_decay_updates = max(int(heuristic_prior_decay_updates), 0)
+        self.heuristic_prior_score_clip = max(float(heuristic_prior_score_clip), 0.0)
         self.buffer = PPOBuffer()
         self.training_updates = 0
         self.self_play_games = 0
@@ -110,13 +125,28 @@ class PPOTrainer:
         *,
         deterministic: bool,
         name: str,
-        ) -> PPOPlayer:
+    ) -> PPOPlayer:
         return PPOPlayer(
             model=self.model,
             device=str(self.device),
             deterministic=deterministic,
+            use_heuristic_prior=self.use_heuristic_prior,
+            heuristic_prior_beta=self.current_heuristic_prior_beta(),
+            heuristic_prior_score_clip=self.heuristic_prior_score_clip,
             name=name,
         )
+
+    def current_heuristic_prior_beta(self) -> float:
+        if not self.use_heuristic_prior:
+            return 0.0
+        if self.heuristic_prior_decay_updates <= 0:
+            return float(self.heuristic_prior_beta_end)
+
+        progress = min(float(self.training_updates) / float(self.heuristic_prior_decay_updates), 1.0)
+        beta = self.heuristic_prior_beta_start + (
+            self.heuristic_prior_beta_end - self.heuristic_prior_beta_start
+        ) * progress
+        return float(max(beta, 0.0))
 
     def record_external_episode(
         self,
@@ -137,6 +167,8 @@ class PPOTrainer:
                 action=int(step.action),
                 log_prob=float(step.log_prob),
                 value=float(step.value),
+                player_id=int(step.player_id),
+                heuristic_beta=float(step.heuristic_beta),
             )
             for step in steps
         ]
@@ -221,9 +253,20 @@ class PPOTrainer:
                 )
                 return_tensor = torch.as_tensor(batch["returns"][batch_indices], dtype=torch.float32, device=self.device)
                 advantage_tensor = torch.as_tensor(advantages[batch_indices], dtype=torch.float32, device=self.device)
+                heuristic_prior_scores, heuristic_beta_values = self._build_heuristic_prior_batch(
+                    observations=batch["observations"][batch_indices],
+                    action_masks=batch["action_masks"][batch_indices],
+                    player_ids=batch["player_ids"][batch_indices],
+                    heuristic_betas=batch["heuristic_betas"][batch_indices],
+                )
 
                 logits, values = self.model(observation_tensor)
-                masked_logits = mask_policy_logits(logits, action_mask_tensor)
+                masked_logits = mix_policy_logits_with_prior(
+                    logits,
+                    action_mask_tensor,
+                    prior_scores=heuristic_prior_scores,
+                    beta=heuristic_beta_values,
+                )
                 distribution = Categorical(logits=masked_logits)
                 new_log_probs = distribution.log_prob(action_tensor)
                 entropy = distribution.entropy().mean()
@@ -290,6 +333,11 @@ class PPOTrainer:
                 "self_play_games": self.self_play_games,
                 "heuristic_pool_games": self.heuristic_pool_games,
                 "training_games": self.training_games,
+                "use_heuristic_prior": self.use_heuristic_prior,
+                "heuristic_prior_beta_start": self.heuristic_prior_beta_start,
+                "heuristic_prior_beta_end": self.heuristic_prior_beta_end,
+                "heuristic_prior_decay_updates": self.heuristic_prior_decay_updates,
+                "heuristic_prior_score_clip": self.heuristic_prior_score_clip,
             },
             path,
         )
@@ -357,25 +405,30 @@ class PPOTrainer:
             current_player = int(info["current_player"])
             valid_actions = list(info["valid_actions"])
             if current_player in trajectories:
-                board = np.asarray(observation, dtype=np.int8)
+                policy_observation = np.asarray(observation, dtype=np.int8)
+                raw_board = np.asarray(info.get("board", orient_board_to_player(policy_observation, current_player)), dtype=np.int8)
                 sampled_action = self._sample_policy_action(
-                    observation=board,
+                    observation=policy_observation,
+                    board=raw_board,
+                    player_id=current_player,
                     valid_actions=valid_actions,
                     deterministic=deterministic_policy,
                 )
                 trajectories[current_player].append(
                     PPORolloutStep(
-                        observation=board.copy(),
+                        observation=policy_observation.copy(),
                         action_mask=sampled_action.action_mask.copy(),
                         action=sampled_action.action,
                         log_prob=sampled_action.log_prob,
                         value=sampled_action.value,
+                        player_id=sampled_action.player_id,
+                        heuristic_beta=sampled_action.heuristic_beta,
                     )
                 )
                 self._record_policy_stats(episode_summary, sampled_action)
                 self._record_move_quality(
                     episode_summary,
-                    board=board,
+                    board=policy_observation,
                     valid_actions=valid_actions,
                     action=sampled_action.action,
                     ply_index=move_count,
@@ -446,6 +499,8 @@ class PPOTrainer:
                 action=step.action,
                 log_prob=step.log_prob,
                 value=step.value,
+                player_id=step.player_id,
+                heuristic_beta=step.heuristic_beta,
                 reward=terminal_reward if index == final_index else 0.0,
                 done=index == final_index,
                 info={
@@ -483,16 +538,29 @@ class PPOTrainer:
         self,
         *,
         observation: np.ndarray,
+        board: np.ndarray,
+        player_id: int,
         valid_actions: list[int],
         deterministic: bool,
     ) -> _SampledPolicyAction:
         action_mask = valid_actions_to_mask(valid_actions, self.action_space_size)
         observation_tensor = observations_to_tensor(observation, device=self.device)
         action_mask_tensor = torch.as_tensor(action_mask[None, :], dtype=torch.bool, device=self.device)
+        heuristic_beta = self.current_heuristic_prior_beta()
+        prior_scores = self._build_heuristic_prior_scores(
+            board=board,
+            valid_actions=valid_actions,
+            player_id=player_id,
+        )
 
         with torch.no_grad():
             logits, value = self.model(observation_tensor)
-            masked_logits = mask_policy_logits(logits, action_mask_tensor)
+            masked_logits = mix_policy_logits_with_prior(
+                logits,
+                action_mask_tensor,
+                prior_scores=prior_scores,
+                beta=heuristic_beta if prior_scores is not None else 0.0,
+            )
             distribution = Categorical(logits=masked_logits)
             probabilities = torch.softmax(masked_logits, dim=-1).squeeze(0)
             if deterministic:
@@ -511,12 +579,69 @@ class PPOTrainer:
             log_prob=float(log_prob_tensor.item()),
             value=float(value.squeeze(0).item()),
             action_mask=action_mask,
+            player_id=int(player_id),
+            heuristic_beta=float(heuristic_beta if prior_scores is not None else 0.0),
             selected_action_prob=float(selected_action_prob),
             top1_action_prob=float(top1_action_prob),
             top3_action_prob_sum=float(top3_action_prob_sum),
             entropy=float(entropy),
             valid_action_count=len(valid_actions),
         )
+
+    def _build_heuristic_prior_scores(
+        self,
+        *,
+        board: np.ndarray,
+        valid_actions: Sequence[int],
+        player_id: int,
+    ) -> np.ndarray | None:
+        if not self.use_heuristic_prior or player_id not in {BLACK, WHITE}:
+            return None
+
+        heuristic_scores = build_heuristic_scores(np.asarray(board, dtype=np.int8), valid_actions, int(player_id))
+        return normalize_policy_prior_scores(
+            heuristic_scores,
+            valid_actions,
+            clip_value=self.heuristic_prior_score_clip,
+        )
+
+    def _build_heuristic_prior_batch(
+        self,
+        *,
+        observations: np.ndarray,
+        action_masks: np.ndarray,
+        player_ids: np.ndarray,
+        heuristic_betas: np.ndarray,
+    ) -> tuple[np.ndarray | None, float | np.ndarray]:
+        if not self.use_heuristic_prior:
+            return None, 0.0
+
+        prior_rows: list[np.ndarray] = []
+        has_nonzero_prior = False
+        beta_values = np.asarray(heuristic_betas, dtype=np.float32)
+        for observation, action_mask, player_id, beta in zip(observations, action_masks, player_ids, beta_values):
+            beta_value = float(beta)
+            if beta_value <= 0.0 or int(player_id) not in {BLACK, WHITE}:
+                prior_rows.append(np.zeros(self.action_space_size, dtype=np.float32))
+                continue
+
+            has_nonzero_prior = True
+            raw_board = orient_board_to_player(np.asarray(observation, dtype=np.int8), int(player_id))
+            valid_actions = np.flatnonzero(np.asarray(action_mask, dtype=bool)).astype(int).tolist()
+            prior_scores = self._build_heuristic_prior_scores(
+                board=raw_board,
+                valid_actions=valid_actions,
+                player_id=int(player_id),
+            )
+            prior_rows.append(
+                np.zeros(self.action_space_size, dtype=np.float32)
+                if prior_scores is None
+                else prior_scores.astype(np.float32, copy=False)
+            )
+
+        if not has_nonzero_prior:
+            return None, 0.0
+        return np.stack(prior_rows).astype(np.float32), beta_values
 
     def _sample_opponent_type(self) -> str:
         opponent_types = list(self.opponent_probs.keys())

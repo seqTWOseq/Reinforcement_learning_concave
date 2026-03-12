@@ -40,9 +40,33 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--move-delay", type=float, default=0.1)
     parser.add_argument("--post-game-delay", type=float, default=3.0)
+    parser.set_defaults(use_heuristic_prior=True)
+    parser.add_argument(
+        "--use-heuristic-prior",
+        dest="use_heuristic_prior",
+        action="store_true",
+        help="Enable heuristic prior injection during PPO play.",
+    )
+    parser.add_argument(
+        "--disable-heuristic-prior",
+        dest="use_heuristic_prior",
+        action="store_false",
+        help="Disable heuristic prior injection during PPO play.",
+    )
+    parser.add_argument("--heuristic-prior-beta-start", type=float, default=1.5)
+    parser.add_argument("--heuristic-prior-beta-end", type=float, default=1.5)
+    parser.add_argument("--heuristic-prior-decay-updates", type=int, default=1)
+    parser.add_argument("--heuristic-prior-score-clip", type=float, default=2.5)
     args = parser.parse_args()
 
-    trainer = PPOTrainer(device=args.device)
+    trainer = PPOTrainer(
+        device=args.device,
+        use_heuristic_prior=args.use_heuristic_prior,
+        heuristic_prior_beta_start=args.heuristic_prior_beta_start,
+        heuristic_prior_beta_end=args.heuristic_prior_beta_end,
+        heuristic_prior_decay_updates=args.heuristic_prior_decay_updates,
+        heuristic_prior_score_clip=args.heuristic_prior_score_clip,
+    )
     load_checkpoint_or_maybe_warn(
         trainer=trainer,
         path=args.model_path,

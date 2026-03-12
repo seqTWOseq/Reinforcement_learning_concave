@@ -51,15 +51,31 @@ def main() -> None:
     )
     parser.add_argument("--games-per-color", type=int, default=5)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--use-heuristic-prior", action="store_true")
+    parser.add_argument("--heuristic-prior-beta-start", type=float, default=0.0)
+    parser.add_argument("--heuristic-prior-beta-end", type=float, default=0.0)
+    parser.add_argument("--heuristic-prior-decay-updates", type=int, default=0)
+    parser.add_argument("--heuristic-prior-score-clip", type=float, default=2.5)
     args = parser.parse_args()
 
-    trainer = PPOTrainer(device=args.device)
+    trainer = PPOTrainer(
+        device=args.device,
+        use_heuristic_prior=args.use_heuristic_prior,
+        heuristic_prior_beta_start=args.heuristic_prior_beta_start,
+        heuristic_prior_beta_end=args.heuristic_prior_beta_end,
+        heuristic_prior_decay_updates=args.heuristic_prior_decay_updates,
+        heuristic_prior_score_clip=args.heuristic_prior_score_clip,
+    )
     load_checkpoint_or_maybe_warn(
         trainer=trainer,
         path=args.model_path,
         model_label="PPO",
         cli_flag="model-path",
         allow_random_init=args.allow_random_init,
+    )
+    print(
+        f"heuristic_prior_enabled={trainer.use_heuristic_prior} "
+        f"heuristic_prior_beta={trainer.current_heuristic_prior_beta():.4f}"
     )
 
     ppo_player = trainer.build_player(deterministic=True, name="PPO")

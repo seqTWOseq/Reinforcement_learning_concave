@@ -13,6 +13,8 @@ class PPOTransition:
     action: int
     log_prob: float
     value: float
+    player_id: int
+    heuristic_beta: float
     reward: float
     done: bool
     advantage: float = 0.0
@@ -34,6 +36,8 @@ class PPOBuffer:
         action: int,
         log_prob: float,
         value: float,
+        player_id: int = 0,
+        heuristic_beta: float = 0.0,
         reward: float,
         done: bool,
         info: dict[str, Any] | None = None,
@@ -45,6 +49,8 @@ class PPOBuffer:
                 action=int(action),
                 log_prob=float(log_prob),
                 value=float(value),
+                player_id=int(player_id),
+                heuristic_beta=float(heuristic_beta),
                 reward=float(reward),
                 done=bool(done),
                 info=dict(info or {}),
@@ -98,6 +104,8 @@ class PPOBuffer:
             "actions": np.asarray([step.action for step in self._storage], dtype=np.int64),
             "log_probs": np.asarray([step.log_prob for step in self._storage], dtype=np.float32),
             "values": np.asarray([step.value for step in self._storage], dtype=np.float32),
+            "player_ids": np.asarray([step.player_id for step in self._storage], dtype=np.int8),
+            "heuristic_betas": np.asarray([step.heuristic_beta for step in self._storage], dtype=np.float32),
             "rewards": np.asarray([step.reward for step in self._storage], dtype=np.float32),
             "advantages": np.asarray([step.advantage for step in self._storage], dtype=np.float32),
             "returns": np.asarray([step.return_target for step in self._storage], dtype=np.float32),

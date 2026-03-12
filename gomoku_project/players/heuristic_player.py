@@ -6,7 +6,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from gomoku_project.core.constants import BLACK, EMPTY, WHITE
-from gomoku_project.core.utils import action_to_pos
+from gomoku_project.core.utils import action_to_pos, opponent, orient_board_to_player
 from gomoku_project.players.base import BasePlayer
 
 _DIRECTIONS = ((0, 1), (1, 0), (1, 1), (1, -1))
@@ -221,6 +221,43 @@ def _score_patterns(attack: _PatternSummary, defense: _PatternSummary) -> int:
     return attack_score + defense_score
 
 
+def _score_move_for_player(board: np.ndarray, action: int, player_id: int) -> _ScoredMove:
+    if player_id not in {BLACK, WHITE}:
+        raise ValueError(f"Unsupported player_id for heuristic scoring: {player_id}")
+
+    board_size = board.shape[0]
+    row, col = action_to_pos(action, board_size)
+    defending_player = opponent(player_id)
+    attack = _analyze_move(board, action, player_id)
+    defense = _analyze_move(board, action, defending_player)
+    pattern_score = _score_patterns(attack, defense)
+    positional_score = _center_bonus(board_size, row, col) + _connection_bonus(board, row, col, player_id)
+    center = board_size // 2
+    center_distance = abs(row - center) + abs(col - center)
+    return _ScoredMove(
+        action=action,
+        total_score=pattern_score + positional_score,
+        center_distance=center_distance,
+    )
+
+
+def build_heuristic_scores(
+    board: np.ndarray,
+    valid_actions: Sequence[int],
+    player_id: int,
+) -> np.ndarray:
+    board_array = np.asarray(board, dtype=np.int8)
+    action_space_size = board_array.shape[0] * board_array.shape[1]
+    scores = np.zeros(action_space_size, dtype=np.float32)
+    if not valid_actions:
+        return scores
+
+    for action in valid_actions:
+        scored_move = _score_move_for_player(board_array, int(action), int(player_id))
+        scores[int(action)] = float(scored_move.total_score)
+    return scores
+
+
 class HeuristicPlayer(BasePlayer):
     def __init__(
         self,
@@ -243,9 +280,15 @@ class HeuristicPlayer(BasePlayer):
         if not valid_actions:
             return 0
 
-        board = np.asarray(observation, dtype=np.int8)
+        current_player = info.get("current_player", self.player_id)
+        player_id = int(current_player) if current_player in {BLACK, WHITE} else BLACK
+        raw_board = info.get("board")
+        if isinstance(raw_board, np.ndarray):
+            board = np.asarray(raw_board, dtype=np.int8)
+        else:
+            board = orient_board_to_player(np.asarray(observation, dtype=np.int8), player_id)
         board_size = board.shape[0]
-        scored_moves = [self._score_move(board, int(action)) for action in valid_actions]
+        scored_moves = [self._score_move(board, int(action), player_id) for action in valid_actions]
         best_score = max(move.total_score for move in scored_moves)
         best_moves = [move for move in scored_moves if move.total_score == best_score]
         closest_distance = min(move.center_distance for move in best_moves)
@@ -256,17 +299,5 @@ class HeuristicPlayer(BasePlayer):
         self.last_policy_target[chosen_move.action] = 1.0
         return int(chosen_move.action)
 
-    def _score_move(self, board: np.ndarray, action: int) -> _ScoredMove:
-        board_size = board.shape[0]
-        row, col = action_to_pos(action, board_size)
-        attack = _analyze_move(board, action, BLACK)
-        defense = _analyze_move(board, action, WHITE)
-        pattern_score = _score_patterns(attack, defense)
-        positional_score = _center_bonus(board_size, row, col) + _connection_bonus(board, row, col, BLACK)
-        center = board_size // 2
-        center_distance = abs(row - center) + abs(col - center)
-        return _ScoredMove(
-            action=action,
-            total_score=pattern_score + positional_score,
-            center_distance=center_distance,
-        )
+    def _score_move(self, board: np.ndarray, action: int, player_id: int) -> _ScoredMove:
+        return _score_move_for_player(board, action, player_id)

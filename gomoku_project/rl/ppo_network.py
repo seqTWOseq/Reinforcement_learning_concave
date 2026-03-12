@@ -37,11 +37,73 @@ def valid_actions_to_mask(valid_actions: Sequence[int], action_space_size: int) 
     return mask
 
 
+def normalize_policy_prior_scores(
+    prior_scores: np.ndarray,
+    valid_actions: Sequence[int],
+    *,
+    clip_value: float = 3.0,
+    epsilon: float = 1e-6,
+) -> np.ndarray:
+    prior_array = np.asarray(prior_scores, dtype=np.float32)
+    normalized = np.zeros_like(prior_array, dtype=np.float32)
+    valid_indices = np.asarray(list(valid_actions), dtype=np.int64)
+    if valid_indices.size == 0:
+        return normalized
+
+    valid_values = prior_array[valid_indices]
+    if valid_values.size <= 1 or float(np.max(valid_values) - np.min(valid_values)) < epsilon:
+        return normalized
+
+    mean = float(valid_values.mean())
+    std = float(valid_values.std())
+    if std >= epsilon:
+        scaled_values = (valid_values - mean) / std
+    else:
+        centered = valid_values - mean
+        max_abs = float(np.max(np.abs(centered)))
+        if max_abs < epsilon:
+            return normalized
+        scaled_values = centered / max_abs
+
+    if clip_value > 0.0:
+        scaled_values = np.clip(scaled_values, -clip_value, clip_value)
+    normalized[valid_indices] = scaled_values.astype(np.float32)
+    return normalized
+
+
 def mask_policy_logits(logits: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
     if action_mask.dtype != torch.bool:
         action_mask = action_mask.bool()
     invalid_fill = torch.full_like(logits, -1e9)
     return torch.where(action_mask, logits, invalid_fill)
+
+
+def mix_policy_logits_with_prior(
+    logits: torch.Tensor,
+    action_mask: torch.Tensor,
+    *,
+    prior_scores: np.ndarray | torch.Tensor | None = None,
+    beta: float | np.ndarray | torch.Tensor = 0.0,
+) -> torch.Tensor:
+    if prior_scores is None:
+        return mask_policy_logits(logits, action_mask)
+
+    prior_tensor = torch.as_tensor(prior_scores, dtype=logits.dtype, device=logits.device)
+    if prior_tensor.ndim == 1:
+        prior_tensor = prior_tensor.unsqueeze(0)
+    if prior_tensor.shape != logits.shape:
+        raise ValueError(
+            f"Expected prior_scores shape {tuple(logits.shape)}, got {tuple(prior_tensor.shape)}."
+        )
+
+    beta_tensor = torch.as_tensor(beta, dtype=logits.dtype, device=logits.device)
+    if beta_tensor.ndim == 0:
+        beta_tensor = beta_tensor.reshape(1, 1)
+    elif beta_tensor.ndim == 1:
+        beta_tensor = beta_tensor.unsqueeze(-1)
+
+    mixed_logits = logits + beta_tensor * prior_tensor
+    return mask_policy_logits(mixed_logits, action_mask)
 
 
 class ResidualBlock(nn.Module):

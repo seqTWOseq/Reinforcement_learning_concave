@@ -46,6 +46,23 @@ def main() -> None:
     parser.add_argument("--minibatch-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--deterministic-ppo", action="store_true")
+    parser.set_defaults(use_heuristic_prior=True)
+    parser.add_argument(
+        "--use-heuristic-prior",
+        dest="use_heuristic_prior",
+        action="store_true",
+        help="Enable heuristic prior injection during PPO training.",
+    )
+    parser.add_argument(
+        "--disable-heuristic-prior",
+        dest="use_heuristic_prior",
+        action="store_false",
+        help="Disable heuristic prior injection and train PPO without heuristic guidance.",
+    )
+    parser.add_argument("--heuristic-prior-beta-start", type=float, default=1.5)
+    parser.add_argument("--heuristic-prior-beta-end", type=float, default=0.0)
+    parser.add_argument("--heuristic-prior-decay-updates", type=int, default=200)
+    parser.add_argument("--heuristic-prior-score-clip", type=float, default=2.5)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--move-delay", type=float, default=0.0)
     parser.add_argument("--post-game-delay", type=float, default=1.0)
@@ -65,6 +82,11 @@ def main() -> None:
         update_epochs=args.update_epochs,
         minibatch_size=args.minibatch_size,
         seed=args.seed,
+        use_heuristic_prior=args.use_heuristic_prior,
+        heuristic_prior_beta_start=args.heuristic_prior_beta_start,
+        heuristic_prior_beta_end=args.heuristic_prior_beta_end,
+        heuristic_prior_decay_updates=args.heuristic_prior_decay_updates,
+        heuristic_prior_score_clip=args.heuristic_prior_score_clip,
     )
     checkpoint_path, _ = load_checkpoint_or_maybe_warn(
         trainer=trainer,
@@ -76,6 +98,7 @@ def main() -> None:
     )
 
     for game_index in range(1, args.games + 1):
+        current_beta = trainer.current_heuristic_prior_beta()
         ppo_player = trainer.build_player(deterministic=args.deterministic_ppo, name="PPO")
         heuristic_player = HeuristicPlayer(
             name="Heuristic",
@@ -105,6 +128,7 @@ def main() -> None:
         print(
             f"game={game_index} "
             f"matchup={result.matchup} "
+            f"heuristic_prior_beta={current_beta:.4f} "
             f"black={result.black_name} "
             f"white={result.white_name} "
             f"winner={result.winner_name} "
