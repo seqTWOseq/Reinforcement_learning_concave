@@ -667,7 +667,7 @@ def train_main():
     
     N = 10
     EPISODES = 10000
-    UPDATE_INTERVAL = 500 # 통계 리셋 및 상대방 진화 주기
+    UPDATE_INTERVAL = 1000 # 통계 리셋 및 상대방 진화 주기
     
     for gen in range(1, N + 1):
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
