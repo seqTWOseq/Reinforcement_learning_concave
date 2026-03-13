@@ -673,7 +673,7 @@ def train_main():
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
         # 세대 시작 시 탐험률 초기화 및 진행률 표시줄 생성
-        agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 
+        agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998
         
         # 10,000판을 200판 단위로 쪼개어 루프 실행 (총 50개의 구간)
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
