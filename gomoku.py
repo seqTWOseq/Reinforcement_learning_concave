@@ -678,7 +678,7 @@ def train_main():
         # 세대 시작 시 탐험률 초기화 및 진행률 표시줄 생성
         agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998
         
-        # 10,000판을 200판 단위로 쪼개어 루프 실행 (총 50개의 구간)
+        # 10,000판을 500판 단위로 쪼개어 루프 실행 (총 20개의 구간)
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
             phase_end = phase_start + UPDATE_INTERVAL - 1
             
@@ -789,7 +789,7 @@ def train_main():
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
-                agent1.epsilon = 0.2
+                agent1.epsilon = 0.1
                 agent1.epsilon_decay = 0.998
                 print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
 
