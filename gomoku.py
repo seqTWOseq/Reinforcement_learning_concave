@@ -525,7 +525,7 @@ class KhyAgent:
         defense_value = evaluate_for_player(2) 
         
         # 공격과 수비의 가치를 1.0 대 1.0으로 동등하게 합산
-        total_reward = attack_value + defense_value
+        total_reward = (attack_value * 1.1) + defense_value
         
         return total_reward
     
