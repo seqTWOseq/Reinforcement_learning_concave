@@ -316,7 +316,7 @@ def find_urgent_move_fast(state, valid_moves, player):
     return best_move
 
 @njit
-def fast_rollout_fast(state, action, max_depth, max_moves=50):
+def fast_rollout_fast(state, action, max_depth, max_moves=150):
     """C언어 속도로 동작하는 MCTS 시뮬레이션 엔진 (Depth Penalty 추가)"""
     board_size = state.shape[0]
     sim_state = state.copy()
@@ -534,31 +534,34 @@ class KhyAgent:
     # 기억 장치 (데이터 증강 적용)
     def memorize_episode(self, episode_memory, final_reward):
         discounted_reward = final_reward
-        step_cost = 0.02
+        step_cost = 0.02 # 턴이 길어질수록 깎이는 '시간 지연 페널티' (유지)
+        intrinsic_weight = 0.05 # 내재적 보상의 비중을 5%로 대폭 축소 (파밍 방지)
         
         for state, action, step_reward in reversed(episode_memory):
-            total_reward = step_reward + discounted_reward
-            board_size = state.shape[0]
+            # 최종 승패 보상에 '매우 작게 축소된' 모양 만들기 보상을 더함
+            total_reward = discounted_reward + (step_reward * intrinsic_weight)
             
-            # 행동(Action)을 2D 배열 위치로 표현 (보드판과 동일한 회전/반전을 적용하기 위함)
+            board_size = state.shape[0]
             action_matrix = np.zeros((board_size, board_size), dtype=np.int8)
             action_matrix[action // board_size, action % board_size] = 1
             
-            # 8방향 대칭(Symmetry) 데이터 생성
+            # (8방향 대칭 데이터 생성 코드는 기존과 완벽히 동일하므로 그대로 유지)
             for i in range(4):
-                # 1. 0, 90, 180, 270도 회전
                 rot_state = np.rot90(state, k=i)
                 rot_action_mat = np.rot90(action_matrix, k=i)
-                rot_action = np.argmax(rot_action_mat) # 1이 있는 위치의 1D 인덱스 추출
+                rot_action = np.argmax(rot_action_mat) 
                 self.memory.append((rot_state.copy(), rot_action, total_reward))
                 
-                # 2. 회전된 상태에서 좌우 반전(Flip)
                 flip_state = np.fliplr(rot_state)
                 flip_action_mat = np.fliplr(rot_action_mat)
                 flip_action = np.argmax(flip_action_mat)
                 self.memory.append((flip_state.copy(), flip_action, total_reward))
                 
-            discounted_reward = max(discounted_reward * self.gamma - step_cost, -1.0)
+            # 핵심 논리: 다음 스텝(더 이전 턴)으로 갈수록 시간 감가 적용 및 페널티 부여
+            discounted_reward = discounted_reward * self.gamma - step_cost
+            
+            # 보상이 -1.0 밑으로 무한히 떨어져서 학습이 붕괴되는 것을 방어
+            discounted_reward = max(discounted_reward, -1.0)
     
     # 복습 엔진
     def replay_experience(self):
@@ -655,7 +658,7 @@ def train_main():
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_ep1000.pth")
+    # agent1.load_model("khy_omok_ep1000.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
@@ -667,7 +670,7 @@ def train_main():
     
     N = 10
     EPISODES = 10000
-    UPDATE_INTERVAL = 1000 # 통계 리셋 및 상대방 진화 주기
+    UPDATE_INTERVAL = 2000 # 통계 리셋 및 상대방 진화 주기
     
     for gen in range(1, N + 1):
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
@@ -698,7 +701,7 @@ def train_main():
                     current_player = info["current_player"]
                     
                     # 50수 제한 강제 패배 로직
-                    if current_episode_steps >= 50:
+                    if current_episode_steps >= 150:
                         terminated = True
                         info["winner"] = 0 
                         break 
