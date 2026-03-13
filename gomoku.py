@@ -315,29 +315,31 @@ def find_urgent_move_fast(state, valid_moves, player):
 
 @njit
 def fast_rollout_fast(state, action, max_depth, max_moves=50):
-    """C언어 속도로 동작하는 MCTS 시뮬레이션 엔진 (50수 제한 룰 추가)"""
+    """C언어 속도로 동작하는 MCTS 시뮬레이션 엔진 (Depth Penalty 추가)"""
     board_size = state.shape[0]
     sim_state = state.copy()
     r = action // board_size
     c = action % board_size
     sim_state[r, c] = 1 
     
-    # 1. 현재 보드판에 놓인 전체 돌의 개수 카운트
     current_stones = 0
     for i in range(board_size):
         for j in range(board_size):
             if sim_state[i, j] != 0:
                 current_stones += 1
                 
-    # 내가 방금 둔 수로 승리했는지 확인
+    # 내가 방금 둔 수로 즉시 승리 (최고 보상)
     if check_pattern_fast(sim_state, r, c, 1, 5, 0):
         return 1.0 
         
     current_player = 2
-    for _ in range(max_depth):
-        # 핵심: 현재 돌의 개수가 max_moves(50수)에 도달하면 무조건 무승부(-0.5) 처리
+    # 탐색 깊이에 따른 페널티 가중치 (한 수당 0.05씩 감가)
+    depth_penalty_weight = 0.05 
+
+    for depth in range(max_depth):
+        # 50수에 도달하면 강력한 페널티 부여 (-0.8)
         if current_stones >= max_moves:
-            return -0.5
+            return -0.8
             
         valid_moves = np.where(sim_state.flatten() == 0)[0]
         if len(valid_moves) == 0:
@@ -353,14 +355,20 @@ def fast_rollout_fast(state, action, max_depth, max_moves=50):
         sr = sim_action // board_size
         sc = sim_action % board_size
         sim_state[sr, sc] = current_player
-        current_stones += 1 # 돌이 놓일 때마다 카운트 증가
+        current_stones += 1 
         
+        # 누군가 승리했을 때의 처리
         if check_pattern_fast(sim_state, sr, sc, current_player, 5, 0):
-            return 1.0 if current_player == 1 else -1.0 
+            # 핵심: 늦게 이길수록 보상이 줄어들고, 늦게 질수록 페널티가 줄어듦
+            penalty = depth * depth_penalty_weight
+            if current_player == 1:
+                return 1.0 - penalty # 빨리 이길수록 1.0에 가까움
+            else:
+                return -1.0 + penalty # 빨리 질수록 -1.0에 가까움 (최대한 버티도록)
             
         current_player = 3 - current_player
         
-    return 0.0  
+    return 0.0 
     
 class KhyAgent:
     def __init__(self, model):
@@ -443,9 +451,22 @@ class KhyAgent:
         
         sim_q_values = np.divide(action_wins, action_visits, out=np.zeros_like(action_wins), where=action_visits!=0)
         
+        # 내재적 보상(공격 포메이션)을 계산하여 합산할 배열 준비
+        intrinsic_rewards = np.zeros(total_grids)
+        for move in valid_moves:
+            # 행동마다 유발되는 공격 포메이션 가치 평가
+            intrinsic_rewards[move] = self.get_intrinsic_reward(state, move)
+        
         # Policy와 Rollout Value 결합
-        alpha = 0.5
-        final_score = np.where(action_visits > 0, (alpha * policy_probs) + ((1 - alpha) * sim_q_values), policy_probs)
+        alpha = 0.4  # 신경망 정책 가중치
+        beta = 0.4   # MCTS 롤아웃 가중치
+        gamma = 0.2  # 내재적 보상(공격성) 가중치 - 이 값을 높이면 더 공격적으로 변함
+
+        final_score = np.where(
+            action_visits > 0, 
+            (alpha * policy_probs) + (beta * sim_q_values) + (gamma * intrinsic_rewards), 
+            policy_probs + (gamma * intrinsic_rewards) # 롤아웃 안 된 곳도 내재적 보상은 평가
+        )
         final_score[~np.isin(np.arange(total_grids), valid_moves)] = -float('inf')
 
         return np.argmax(final_score)
@@ -494,7 +515,8 @@ class KhyAgent:
     
     # 기억 장치 (데이터 증강 적용)
     def memorize_episode(self, episode_memory, final_reward):
-        discounted_reward = final_reward 
+        discounted_reward = final_reward
+        step_cost = 0.02
         
         for state, action, step_reward in reversed(episode_memory):
             total_reward = step_reward + discounted_reward
@@ -518,7 +540,7 @@ class KhyAgent:
                 flip_action = np.argmax(flip_action_mat)
                 self.memory.append((flip_state.copy(), flip_action, total_reward))
                 
-            discounted_reward *= self.gamma
+            discounted_reward = max(discounted_reward * self.gamma - step_cost, -1.0)
     
     # 복습 엔진
     def replay_experience(self):
@@ -636,11 +658,11 @@ def train_main():
             # --- 4단계 막(Phase) 전환 커리큘럼 ---
             if episode == 1:
                 pbar = tqdm(total=10000, desc=f"[Gen {gen}] 1막 VS 셀프", position=0, leave=True)
-                agent1.epsilon, agent1.epsilon_decay = 0.7, 0.998 # 백지상태이므로 탐험률 높게 시작
+                agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 # 백지상태이므로 탐험률 높게 시작
             # elif episode == 2001:
             #     pbar.close()
             #     agent1_wins, total_phase_steps = 0, 0
-            #     agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 # 휴리스틱 상대로 적절한 탐험
+            #     agent1.epsilon, agent1.epsilon_decay = 0.15, 0.998 # 휴리스틱 상대로 적절한 탐험
             #     pbar = tqdm(total=2000, desc=f"[Gen {gen}] 2막 VS 휴리스틱", position=0, leave=True)
             # elif episode == 4001:
             #     pbar.close()
@@ -677,11 +699,11 @@ def train_main():
                 else:
                     inverted_state = np.where(state != 0, 3 - state, 0)
                     
-                    # 커리큘럼에 따른 상대방 선택 로직
-                    if (1 <= episode <= 2000) or (4001 <= episode <= 8000):
-                        action = agent2_self.select_action(inverted_state) 
-                    else:
-                        action = agent_heur.select_action(inverted_state) 
+                    # # 커리큘럼에 따른 상대방 선택 로직
+                    # if (1 <= episode <= 2000) or (4001 <= episode <= 8000):
+                    action = agent2_self.select_action(inverted_state) 
+                    # else:
+                    #     action = agent_heur.select_action(inverted_state) 
                         
                     step_reward = agent1.get_intrinsic_reward(inverted_state, action)
                     memory_w.append((inverted_state.copy(), action, step_reward))
@@ -737,8 +759,8 @@ def train_main():
             if episode % 1000 == 0:
                 agent1.save_model(f"khy_omok_ep{episode}.pth")
                 # 셀프 플레이 구간에서는 1000판마다 상대방(과거의 나) 업데이트
-                if (1 <= episode < 2000) or (4000 <= episode < 8000):
-                    agent2_self.model.load_state_dict(agent1.model.state_dict())
+                # if (1 <= episode < 2000) or (4000 <= episode < 8000):
+                agent2_self.model.load_state_dict(agent1.model.state_dict())
                 
         if pbar is not None:
             pbar.close()
