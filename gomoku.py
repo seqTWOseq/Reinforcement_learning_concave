@@ -471,47 +471,63 @@ class KhyAgent:
 
         return np.argmax(final_score)
     
-    # 내재적 보상 (공격 포메이션 평가) - 이 부분은 Numba 외부로 남겨두었습니다. 필요시 통합 가능.
+    # 내재적 보상 (1:1 공수 완벽 밸런스 평가)
     def get_intrinsic_reward(self, state, action):
         board_size = state.shape[0]
         r, c = action // board_size, action % board_size
-        sim_state = state.copy()
-        sim_state[r, c] = 1
         
-        reward = 0.0
-        directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
-        pattern_counts = {'open_3': 0, 'four': 0}
+        # 특정 플레이어(나 또는 상대) 입장에서 해당 위치의 패턴 가치를 계산하는 내부 함수
+        def evaluate_for_player(target_player):
+            sim_state = state.copy()
+            sim_state[r, c] = target_player # 평가하려는 플레이어의 돌을 놓아봄
+            
+            score = 0.0
+            directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
+            pattern_counts = {'open_3': 0, 'four': 0}
+            
+            for dr, dc in directions:
+                consecutive = 1
+                open_ends = 0
+                
+                for step in (1, -1):
+                    nr, nc = r + dr * step, c + dc * step
+                    while 0 <= nr < board_size and 0 <= nc < board_size:
+                        if sim_state[nr, nc] == target_player:
+                            consecutive += 1
+                        elif sim_state[nr, nc] == 0:
+                            open_ends += 1
+                            break 
+                        else:
+                            break 
+                        nr += dr * step
+                        nc += dc * step
+                
+                # 순수 포메이션 가치 평가 (돌이 놓였을 때의 파괴력)
+                if consecutive >= 5:
+                    score += 2.0  
+                elif consecutive == 4 and open_ends >= 1:
+                    score += 1.0  
+                    pattern_counts['four'] += 1
+                elif consecutive == 3 and open_ends == 2:
+                    score += 0.4  
+                    pattern_counts['open_3'] += 1
+            
+            # 양수겸장(3-3, 4-3 등) 평가
+            if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
+                score += 2.0
+                
+            return score
+
+        # 1. 공격 가치: 내가(1) 두었을 때 얻는 포메이션 점수
+        attack_value = evaluate_for_player(1) 
         
-        for dr, dc in directions:
-            consecutive = 1
-            open_ends = 0
-            
-            for step in (1, -1):
-                nr, nc = r + dr * step, c + dc * step
-                while 0 <= nr < board_size and 0 <= nc < board_size:
-                    if sim_state[nr, nc] == 1:
-                        consecutive += 1
-                    elif sim_state[nr, nc] == 0:
-                        open_ends += 1
-                        break 
-                    else:
-                        break 
-                    nr += dr * step
-                    nc += dc * step
-            
-            if consecutive >= 5:
-                reward += 1.0  
-            elif consecutive == 4 and open_ends >= 1:
-                reward += 0.5  
-                pattern_counts['four'] += 1
-            elif consecutive == 3 and open_ends == 2:
-                reward += 0.2  
-                pattern_counts['open_3'] += 1
+        # 2. 수비 가치: 상대(2)가 두었다면 얻었을 포메이션 점수를 빼앗음
+        defense_value = evaluate_for_player(2) 
         
-        if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
-            reward += 1.5
-            
-        return reward
+        # 공격과 수비의 가치를 1.0 대 1.0으로 동등하게 합산
+        total_reward = attack_value + defense_value
+        
+        return total_reward
     
     # 기억 장치 (데이터 증강 적용)
     def memorize_episode(self, episode_memory, final_reward):
@@ -648,100 +664,134 @@ def train_main():
     agent2_self.eval_mode()
     
     N = 10
-    EPISODES = 10000 
+    EPISODES = 10000
+    UPDATE_INTERVAL = 200 # 통계 리셋 및 상대방 진화 주기
     
     for gen in range(1, N + 1):
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
-        agent1_wins, total_steps = 0, 0
-        
         # 세대 시작 시 탐험률 초기화 및 진행률 표시줄 생성
         agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 
-        pbar = tqdm(total=EPISODES, desc=f"[Gen {gen}] 셀프 플레이 학습", position=0, leave=True)
         
-        for episode in range(1, EPISODES + 1):
-            state, info = env.reset()
-            terminated = False
-            memory_b, memory_w = [], []
-            current_episode_steps = 0 
+        # 10,000판을 200판 단위로 쪼개어 루프 실행 (총 50개의 구간)
+        for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
+            phase_end = phase_start + UPDATE_INTERVAL - 1
             
-            # --- 단일 에피소드(게임) 진행 ---
-            while not terminated:
-                current_player = info["current_player"]
+            # 핵심: 200판마다 통계(승리 횟수, 턴 수)를 0으로 초기화하여 '현재 상대'에 대한 진짜 실력만 측정
+            agent1_wins, total_steps = 0, 0
+            
+            # 새로운 200판 단위의 진행바 생성
+            pbar = tqdm(total=UPDATE_INTERVAL, desc=f"[Gen {gen}] {phase_start}~{phase_end}판", position=0, leave=True)
+            
+            for episode in range(phase_start, phase_end + 1):
+                state, info = env.reset()
+                terminated = False
+                memory_b, memory_w = [], []
+                current_episode_steps = 0 
                 
-                # 50수 제한 강제 패배 로직 (빠른 승리 유도)
-                if current_episode_steps >= 50:
-                    terminated = True
-                    info["winner"] = 0 # 50수 초과 시 흑(agent1) 패배/무승부 처리
-                    break 
-                
-                if current_player == 1: # 메인 에이전트 턴 (흑)
-                    action = agent1.select_action(state)
-                    step_reward = agent1.get_intrinsic_reward(state, action)
-                    memory_b.append((state.copy(), action, step_reward))
-                    next_state, reward, terminated, _, info = env.step(action)
-                    state = next_state
-                else: # 상대방 에이전트 턴 (백)
-                    inverted_state = np.where(state != 0, 3 - state, 0)
-                    action = agent2_self.select_action(inverted_state) 
-                    step_reward = agent1.get_intrinsic_reward(inverted_state, action)
-                    memory_w.append((inverted_state.copy(), action, step_reward))
-                    next_state, reward, terminated, _, info = env.step(action)
-                    state = next_state
+                agent1_color = 1 if np.random.rand() < 0.5 else 2
+
+                # --- 단일 에피소드(게임) 진행 ---
+                while not terminated:
+                    current_player = info["current_player"]
                     
-                current_episode_steps += 1 
-            
-            total_steps += current_episode_steps
+                    # 50수 제한 강제 패배 로직 (빠른 승리 유도)
+                    if current_episode_steps >= 50:
+                        terminated = True
+                        info["winner"] = 0 
+                        break 
+                    
+                    is_opening = current_episode_steps < 2
 
-            # --- 게임 종료 후: 승패 기록 및 복습 ---
-            winner = info.get("winner")
-            if winner == 1:
-                agent1_wins += 1
-                agent1.memorize_episode(memory_b, 1.0)   
-                agent1.memorize_episode(memory_w, -1.0)  
-            elif winner == 2:
-                agent1.memorize_episode(memory_b, -1.0)  
-                agent1.memorize_episode(memory_w, 1.0)   
-            else: # 무승부
-                agent1.memorize_episode(memory_b, -0.5)
-                agent1.memorize_episode(memory_w, -0.5)
+                    if current_player == agent1_color: 
+                        # agent1의 턴
+                        if is_opening:
+                            # 초반에는 합리적인 빈칸 중 아무데나 랜덤하게 둠
+                            valid_moves = np.where(state.flatten() == 0)[0]
+                            action = np.random.choice(valid_moves)
+                        else:
+                            action = agent1.select_action(state)
+                            
+                        step_reward = agent1.get_intrinsic_reward(state, action)
+                        
+                        # 자신이 흑이면 memory_b에, 백이면 memory_w에 저장
+                        if agent1_color == 1:
+                            memory_b.append((state.copy(), action, step_reward))
+                        else:
+                            memory_w.append((state.copy(), action, step_reward))
+                            
+                    else: 
+                        # agent2_self (상대방)의 턴
+                        inverted_state = np.where(state != 0, 3 - state, 0)
+                        
+                        if is_opening:
+                            valid_moves = np.where(inverted_state.flatten() == 0)[0]
+                            action = np.random.choice(valid_moves)
+                        else:
+                            action = agent2_self.select_action(inverted_state) 
+                            
+                        step_reward = agent1.get_intrinsic_reward(inverted_state, action)
+                        
+                        if agent1_color == 1:
+                            memory_w.append((inverted_state.copy(), action, step_reward))
+                        else:
+                            memory_b.append((inverted_state.copy(), action, step_reward))
+
+                    next_state, reward, terminated, _, info = env.step(action)
+                    state = next_state
+                    current_episode_steps += 1
+
+                total_steps += current_episode_steps
+
+                # --- 게임 종료 후: 승패 기록 및 복습 ---
+                winner = info.get("winner")
+                if winner == 1:
+                    agent1_wins += 1
+                    agent1.memorize_episode(memory_b, 1.0)   
+                    agent1.memorize_episode(memory_w, -1.0)  
+                elif winner == 2:
+                    agent1.memorize_episode(memory_b, -1.0)  
+                    agent1.memorize_episode(memory_w, 1.0)   
+                else: 
+                    agent1.memorize_episode(memory_b, -0.5)
+                    agent1.memorize_episode(memory_w, -0.5)
+                    
+                for _ in range(4):
+                    agent1.replay_experience()
+
+                # --- 통계 계산 (1~10000판 누적이 아닌, 현재 200판 구간 내의 통계) ---
+                current_phase_ep = episode - phase_start + 1
+                win_rate = (agent1_wins / current_phase_ep) * 100
+                avg_steps = total_steps // current_phase_ep
+
+                pbar.set_postfix({
+                    "승률": f"{agent1_wins}/{current_phase_ep} ({win_rate:.1f}%)",
+                    "현재": f"{current_episode_steps}수",
+                    "평균": f"{avg_steps}수",
+                    "입실론": f"{agent1.epsilon:.3f}",
+                    "메모리": f"{len(agent1.memory)}"
+                })
+                pbar.update(1)
                 
-            for _ in range(4):
-                agent1.replay_experience()
+                agent1.decay_epsilon()
 
-            # --- 통계 계산 및 진행바 업데이트 ---
-            win_rate = (agent1_wins / episode) * 100
-            avg_steps = total_steps // episode
+                # 모델 체크포인트 저장 (1000판 주기)
+                if episode % 1000 == 0:
+                    agent1.save_model(f"khy_omok_ep{episode}.pth")
+                    pbar.write(f"{episode}판: 모델 체크포인트")
 
-            pbar.set_postfix({
-                "승률": f"{agent1_wins}/{episode} ({win_rate:.1f}%)",
-                "현재": f"{current_episode_steps}수",
-                "평균": f"{avg_steps}수",
-                "입실론": f"{agent1.epsilon:.3f}",
-                "메모리": f"{len(agent1.memory)}"
-            })
-            pbar.update(1)
+            # 200판 구간 종료 시 진행바 닫기
+            pbar.close()
             
-            agent1.decay_epsilon()
-
-            # --- 상대방 업데이트 및 체크포인트 저장 ---
-            # 1. 상대방(agent2_self) 가중치 업데이트 (200판 주기)
-            if episode % 200 == 0:
+            # --- 200판 종료 직후: 상대방 진화 및 탐험률 롤백 ---
+            if phase_end < EPISODES: # 마지막 판이 아닐 때만 업데이트 수행
                 agent2_self.model.load_state_dict(agent1.model.state_dict())
-                agent1.epsilon = 0.1 # 탐험률 롤백
+                agent1.epsilon = 0.1 # 과적합 방지를 위해 새로운 수 탐색 허용
                 agent1.epsilon_decay = 0.998
-                pbar.write(f"\n[업데이트] {episode}판: 상대방 진화 완료 (입실론 롤백: {agent1.epsilon:.3f})")
+                print(f"[업데이트] {phase_end}판 종료: [입실론 롤백: {agent1.epsilon:.3f}]\n")
 
-            # 2. 모델 체크포인트 저장 (1000판 주기)
-            if episode % 1000 == 0:
-                agent1.save_model(f"khy_omok_ep{episode}.pth")
-                pbar.write(f"\n[저장] {episode}판: 모델 체크포인트 저장 완료")
-
-        # 진행률 표시줄 종료
-        pbar.close()
-        
-        # 세대별 최종 모델 저장
-        agent1.save_model(f"khy_omok_gen_{gen}_final.pth")
+        # 10,000판 (1세대) 종료 후 최종 모델 저장
+        agent1.save_model(f"khy_omok_gen{gen}_final.pth")
         
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
     env.close()
