@@ -592,7 +592,7 @@ def main():
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
-    agent1.load_model("khy_omok_ep2000.pth")
+    agent1.load_model("khy_omok_ep1000.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -634,16 +634,18 @@ def main():
 def train_main():
     env = OmokEnvGUI(render_mode=None)
     
+    # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
+    # agent1.load_model("khy_omok_ep1000.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
+    # 셀프 대결을 위한 상대방 에이전트 (과거의 나)
     model2 = DualHeadResOmokCNN()
     agent2_self = KhyAgent(model2)
+    agent2_self.model.load_state_dict(agent1.model.state_dict())
     agent2_self.eval_mode()
-    
-    agent_heur = HeuristicAgent(name="Heuristic_White")
     
     N = 10
     EPISODES = 10000 
@@ -651,30 +653,13 @@ def train_main():
     for gen in range(1, N + 1):
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
-        agent1_wins, total_phase_steps = 0, 0
-        pbar = None
+        agent1_wins, total_steps = 0, 0
+        
+        # 세대 시작 시 탐험률 초기화 및 진행률 표시줄 생성
+        agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 
+        pbar = tqdm(total=EPISODES, desc=f"[Gen {gen}] 셀프 플레이 학습", position=0, leave=True)
         
         for episode in range(1, EPISODES + 1):
-            # --- 4단계 막(Phase) 전환 커리큘럼 ---
-            if episode == 1:
-                pbar = tqdm(total=10000, desc=f"[Gen {gen}] 1막 VS 셀프", position=0, leave=True)
-                agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998 # 백지상태이므로 탐험률 높게 시작
-            # elif episode == 2001:
-            #     pbar.close()
-            #     agent1_wins, total_phase_steps = 0, 0
-            #     agent1.epsilon, agent1.epsilon_decay = 0.15, 0.998 # 휴리스틱 상대로 적절한 탐험
-            #     pbar = tqdm(total=2000, desc=f"[Gen {gen}] 2막 VS 휴리스틱", position=0, leave=True)
-            # elif episode == 4001:
-            #     pbar.close()
-            #     agent1_wins, total_phase_steps = 0, 0
-            #     agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998 # 배운 것을 바탕으로 셀프 심화 학습
-            #     pbar = tqdm(total=4000, desc=f"[Gen {gen}] 3막 VS 셀프 (심화)", position=0, leave=True)
-            # elif episode == 8001:
-            #     pbar.close()
-            #     agent1_wins, total_phase_steps = 0, 0
-            #     agent1.epsilon, agent1.epsilon_decay = 0.0, 1.0 # 탐험 없이 실력 검증
-            #     pbar = tqdm(total=2000, desc=f"[Gen {gen}] 4막 VS 휴리스틱 (검증)", position=0, leave=True)
-                
             state, info = env.reset()
             terminated = False
             memory_b, memory_w = [], []
@@ -684,27 +669,21 @@ def train_main():
             while not terminated:
                 current_player = info["current_player"]
                 
-                # 60수 제한 강제 패배 로직 추가
+                # 50수 제한 강제 패배 로직 (빠른 승리 유도)
                 if current_episode_steps >= 50:
                     terminated = True
-                    info["winner"] = 0 # 50수 초과 시 무조건 흑(agent1) 패배 처리
-                    break # 게임 루프 탈출
+                    info["winner"] = 0 # 50수 초과 시 흑(agent1) 패배/무승부 처리
+                    break 
                 
-                if current_player == 1:
+                if current_player == 1: # 메인 에이전트 턴 (흑)
                     action = agent1.select_action(state)
                     step_reward = agent1.get_intrinsic_reward(state, action)
                     memory_b.append((state.copy(), action, step_reward))
                     next_state, reward, terminated, _, info = env.step(action)
                     state = next_state
-                else:
+                else: # 상대방 에이전트 턴 (백)
                     inverted_state = np.where(state != 0, 3 - state, 0)
-                    
-                    # # 커리큘럼에 따른 상대방 선택 로직
-                    # if (1 <= episode <= 2000) or (4001 <= episode <= 8000):
                     action = agent2_self.select_action(inverted_state) 
-                    # else:
-                    #     action = agent_heur.select_action(inverted_state) 
-                        
                     step_reward = agent1.get_intrinsic_reward(inverted_state, action)
                     memory_w.append((inverted_state.copy(), action, step_reward))
                     next_state, reward, terminated, _, info = env.step(action)
@@ -712,7 +691,7 @@ def train_main():
                     
                 current_episode_steps += 1 
             
-            total_phase_steps += current_episode_steps
+            total_steps += current_episode_steps
 
             # --- 게임 종료 후: 승패 기록 및 복습 ---
             winner = info.get("winner")
@@ -731,20 +710,11 @@ def train_main():
                 agent1.replay_experience()
 
             # --- 통계 계산 및 진행바 업데이트 ---
-            if episode <= 10000:
-                current_ep = episode
-            # elif episode <= 4000:
-            #     current_ep = episode - 2000
-            # elif episode <= 8000:
-            #     current_ep = episode - 4000
-            # else:
-            #     current_ep = episode - 8000
-                
-            win_rate = (agent1_wins / current_ep) * 100
-            avg_steps = total_phase_steps // current_ep
+            win_rate = (agent1_wins / episode) * 100
+            avg_steps = total_steps // episode
 
             pbar.set_postfix({
-                "승률": f"{agent1_wins}/{current_ep} ({win_rate:.1f}%)",
+                "승률": f"{agent1_wins}/{episode} ({win_rate:.1f}%)",
                 "현재": f"{current_episode_steps}수",
                 "평균": f"{avg_steps}수",
                 "입실론": f"{agent1.epsilon:.3f}",
@@ -752,20 +722,26 @@ def train_main():
             })
             pbar.update(1)
             
-            if episode <= 8000:
-                agent1.decay_epsilon()
+            agent1.decay_epsilon()
 
-            # --- 체크포인트 저장 및 셀프 플레이 갱신 ---
+            # --- 상대방 업데이트 및 체크포인트 저장 ---
+            # 1. 상대방(agent2_self) 가중치 업데이트 (200판 주기)
+            if episode % 200 == 0:
+                agent2_self.model.load_state_dict(agent1.model.state_dict())
+                agent1.epsilon = 0.1 # 탐험률 롤백
+                agent1.epsilon_decay = 0.998
+                pbar.write(f"\n[업데이트] {episode}판: 상대방 진화 완료 (입실론 롤백: {agent1.epsilon:.3f})")
+
+            # 2. 모델 체크포인트 저장 (1000판 주기)
             if episode % 1000 == 0:
                 agent1.save_model(f"khy_omok_ep{episode}.pth")
-                # 셀프 플레이 구간에서는 1000판마다 상대방(과거의 나) 업데이트
-                # if (1 <= episode < 2000) or (4000 <= episode < 8000):
-                agent2_self.model.load_state_dict(agent1.model.state_dict())
-                
-        if pbar is not None:
-            pbar.close()
+                pbar.write(f"\n[저장] {episode}판: 모델 체크포인트 저장 완료")
+
+        # 진행률 표시줄 종료
+        pbar.close()
         
-        agent1.save_model(f"khy_omok_final.pth")
+        # 세대별 최종 모델 저장
+        agent1.save_model(f"khy_omok_gen_{gen}_final.pth")
         
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
     env.close()
