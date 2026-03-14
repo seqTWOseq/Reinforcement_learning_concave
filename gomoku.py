@@ -658,7 +658,7 @@ def train_main():
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_ep1500.pth")
+    # agent1.load_model("khy_omok_ep1500.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
@@ -676,7 +676,7 @@ def train_main():
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
         # 세대 시작 시 탐험률 초기화 및 진행률 표시줄 생성
-        agent1.epsilon, agent1.epsilon_decay = 0.1, 0.998
+        agent1.epsilon, agent1.epsilon_decay = 0.3, 0.998
         
         # 10,000판을 500판 단위로 쪼개어 루프 실행 (총 20개의 구간)
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
@@ -686,6 +686,7 @@ def train_main():
             agent1_wins, total_steps = 0, 0
             
             # 새로운 200판 단위의 진행바 생성
+            agent1_wins, draws, agent1_losses, total_steps = 0, 0, 0, 0
             pbar = tqdm(total=UPDATE_INTERVAL, desc=f"[Gen {gen}] {phase_start}~{phase_end}판", position=0, leave=True)
             
             for episode in range(phase_start, phase_end + 1):
@@ -746,28 +747,43 @@ def train_main():
                 winner = info.get("winner")
                 if winner == agent1_color:
                     agent1_wins += 1
+                elif winner == 0: # 무승부
+                    draws += 1
+                else: # 패배
+                    agent1_losses += 1
 
-                # 데이터 증강 및 양방향 학습 로직 (기존 유지 - 완벽함)
-                if winner == 1:
-                    agent1.memorize_episode(memory_b, 1.0)   
-                    agent1.memorize_episode(memory_w, -1.0)  
-                elif winner == 2:
-                    agent1.memorize_episode(memory_b, -1.0)  
-                    agent1.memorize_episode(memory_w, 1.0)   
-                else: 
-                    agent1.memorize_episode(memory_b, -0.2)
-                    agent1.memorize_episode(memory_w, -0.2)
+                # 데이터 증강 및 양방향 학습 로직
+                if winner == agent1_color:
+                    final_reward = 1.0  # 내가 이김
+                elif winner == 0:
+                    final_reward = -1.0 # 무승부 (난전 강제를 위한 공멸 페널티 적용 시)
+                else:
+                    final_reward = -1.0 # 내가 짐
+
+                # 오직 내가(agent1) 플레이했던 색깔의 기보만 저장
+                if agent1_color == 1:
+                    agent1.memorize_episode(memory_b, final_reward)
+                else:
+                    agent1.memorize_episode(memory_w, final_reward)
                     
                 for _ in range(4):
                     agent1.replay_experience()
 
                 # --- 통계 계산 (1~10000판 누적이 아닌, 현재 200판 구간 내의 통계) ---
                 current_phase_ep = episode - phase_start + 1
-                win_rate = (agent1_wins / current_phase_ep) * 100
+                decisive_games = agent1_wins + agent1_losses # 승패가 갈린 게임 수
+                
+                if decisive_games > 0:
+                    # 무승부를 제외하고, 순수하게 이기거나 진 게임 중 이긴 비율
+                    win_rate = (agent1_wins / decisive_games) * 100 
+                else:
+                    win_rate = 0.0
+                    
                 avg_steps = total_steps // current_phase_ep
 
                 pbar.set_postfix({
-                    "승률": f"{agent1_wins}/{current_phase_ep} ({win_rate:.1f}%)",
+                    "승/무/패": f"{agent1_wins}/{draws}/{agent1_losses}",
+                    "유효승률": f"{win_rate:.1f}%",
                     "현재": f"{current_episode_steps}수",
                     "평균": f"{avg_steps}수",
                     "입실론": f"{agent1.epsilon:.3f}",
@@ -790,7 +806,7 @@ def train_main():
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
-                agent1.epsilon = 0.1
+                agent1.epsilon = 0.3
                 agent1.epsilon_decay = 0.998
                 print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
 
