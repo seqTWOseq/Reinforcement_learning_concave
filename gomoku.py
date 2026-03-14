@@ -658,7 +658,7 @@ def train_main():
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    # agent1.load_model("khy_omok_ep1000.pth")
+    agent1.load_model("khy_omok_ep1500.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
@@ -785,6 +785,7 @@ def train_main():
                 if win_rate >= 55.0:
                     agent1.save_model(f"khy_omok_ep{phase_end}.pth")
                     agent2_self.model.load_state_dict(agent1.model.state_dict())
+                    agent1.memory.clear()
                     update_msg = "상대방 진화 완료 (승률 55% 돌파)"
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
