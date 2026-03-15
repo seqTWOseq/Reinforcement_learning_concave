@@ -152,90 +152,198 @@ class Agent1:
         valid = np.where(state.flatten() == 0)[0]
         return np.random.choice(valid) if len(valid) > 0 else 0
 
+
+class AgentHeuristic:
+    """
+    규칙 기반 에이전트 (train.py의 HeuristicBot과 동일한 로직).
+    RL 모델 없이도 즉시 사용 가능하며, 기본 공격·수비를 확실히 수행한다.
+
+    착수 우선순위:
+      1순위: 즉시 5목 승리
+      2순위: 상대 3·4목 차단
+      3순위: 내 3목 → 4목 확장
+      4순위: 기존 돌 인접 빈칸 무작위
+    """
+
+    def __init__(self, name="Heuristic_White(○)"):
+        self.name = name
+        self.bs = 15
+
+    def _max_consecutive(self, board, r, c, player):
+        best = 0
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (-1, 1)]:
+            cnt = 1
+            for s in (1, -1):
+                nr, nc = r + dr * s, c + dc * s
+                while 0 <= nr < self.bs and 0 <= nc < self.bs and board[nr, nc] == player:
+                    cnt += 1; nr += dr * s; nc += dc * s
+            best = max(best, cnt)
+        return best
+
+    def select_action(self, state):
+        # state는 항상 '자신=1, 상대=2' 관점으로 전달된다 (inverted_state)
+        board = state.copy()
+        bs = self.bs
+        empty = [(r, c) for r in range(bs) for c in range(bs) if board[r, c] == 0]
+        if not empty:
+            return 0
+
+        win_moves, block_moves, extend_moves = [], [], []
+
+        for r, c in empty:
+            board[r, c] = 1
+            my_cnt = self._max_consecutive(board, r, c, 1)
+            board[r, c] = 0
+
+            board[r, c] = 2
+            opp_cnt = self._max_consecutive(board, r, c, 2)
+            board[r, c] = 0
+
+            if my_cnt >= 5:
+                win_moves.append((r, c))
+            elif opp_cnt >= 3:
+                block_moves.append((opp_cnt, r, c))
+            elif my_cnt == 3:
+                extend_moves.append((r, c))
+
+        if win_moves:
+            r, c = win_moves[0]
+        elif block_moves:
+            block_moves.sort(reverse=True)
+            _, r, c = block_moves[0]
+        elif extend_moves:
+            r, c = extend_moves[0]
+        else:
+            adjacent = set()
+            for br in range(bs):
+                for bc in range(bs):
+                    if board[br, bc] != 0:
+                        for dr in (-1, 0, 1):
+                            for dc in (-1, 0, 1):
+                                nr, nc = br + dr, bc + dc
+                                if 0 <= nr < bs and 0 <= nc < bs and board[nr, nc] == 0:
+                                    adjacent.add((nr, nc))
+            pool = list(adjacent) if adjacent else empty
+            r, c = pool[np.random.randint(len(pool))]
+
+        action = r * bs + c
+        print(f"[{self.name}] 착수: {action} (행={r}, 열={c})")
+        return action
+
+
 class Agent2:
     """
-    학습된 MaskablePPO + OmokCNN 모델을 불러와 최적의 행동을 예측하는 에이전트.
+    RL + 규칙 하이브리드 에이전트.
 
-    [전처리]
-    train.py의 board_to_cnn_obs()와 완전히 동일한 로직으로
-    2D 보드(15×15) → (3, 15, 15) 3채널 이진 배열로 변환:
-      Ch0: 내 돌   (board == 1) → 1.0
-      Ch1: 상대 돌 (board == 2) → 1.0
-      Ch2: 빈칸    (board == 0) → 1.0
-
-    [Action Masking]
-    valid_mask: (225,) bool 1D 배열을 그대로 action_masks 파라미터로 전달.
+    [동작 방식]
+    1. 상대 4목(즉시 승리 위협) 또는 자신의 5목 완성이 가능하면
+       규칙(HeuristicBot 로직)이 강제로 그 수를 둔다. (치명적 실수 방지)
+    2. 위 조건이 없을 때만 RL 모델의 예측을 사용한다.
+    3. 모델 로드에 실패하면 AgentHeuristic 전체로 폴백한다.
 
     [순환 임포트 방지]
-    train.py 가 gomoku.py 를 임포트하므로, OmokCNN 은 __init__ 안에서
-    지연 임포트(lazy import)하여 순환 의존성을 피한다.
+    OmokCNN은 __init__ 안에서 지연 임포트(lazy import)한다.
     """
 
     def __init__(self, model_path="omok_model.zip", name="PPO_White(○)"):
         self.name = name
         self.model = None
+        self.bs = 15
+        self._heuristic = AgentHeuristic(name=name + "_fallback")
 
         try:
-            # OmokCNN 지연 임포트 (train → gomoku 순환 임포트 방지)
             from train import OmokCNN
-
             try:
                 from sb3_contrib import MaskablePPO as _PPO
             except ImportError:
                 from stable_baselines3 import PPO as _PPO
 
-            # custom_objects 로 OmokCNN 을 명시해야 zip 로드 시 클래스를 찾을 수 있음
             self.model = _PPO.load(
                 model_path,
                 custom_objects={"features_extractor_class": OmokCNN},
             )
             print(f"[{self.name}] 모델 로드 성공: {model_path}")
         except FileNotFoundError:
-            print(f"[{self.name}] 경고: '{model_path}' 없음 → 랜덤 에이전트로 대체됩니다.")
-            print(f"[{self.name}]  → train.py 를 먼저 실행하여 모델을 학습시키세요.")
+            print(f"[{self.name}] 경고: '{model_path}' 없음 → 규칙 기반으로 대체합니다.")
         except Exception as e:
-            print(f"[{self.name}] 모델 로드 실패: {e} → 랜덤 에이전트로 대체됩니다.")
+            print(f"[{self.name}] 모델 로드 실패: {e}")
+            print(f"[{self.name}] → 규칙 기반(HeuristicBot)으로 대체합니다.")
+
+    def _critical_move(self, state):
+        """
+        우선순위대로 강제 착수 위치를 반환, 없으면 None.
+          P1: 내가 두면 5목 (즉시 승리)
+          P2: 상대가 두면 5목 (즉시 차단)
+          P3: 내가 두면 4목 (승리 준비)
+          P4: 상대가 두면 4목 (4목 차단 — RL이 놓치면 규칙이 막음)
+        """
+        bs = self.bs
+        board = state.copy()
+        my_four, opp_four = None, None
+
+        for r in range(bs):
+            for c in range(bs):
+                if board[r, c] != 0:
+                    continue
+
+                board[r, c] = 1
+                my_cnt = self._heuristic._max_consecutive(board, r, c, 1)
+                board[r, c] = 0
+
+                board[r, c] = 2
+                opp_cnt = self._heuristic._max_consecutive(board, r, c, 2)
+                board[r, c] = 0
+
+                if my_cnt >= 5:           return r * bs + c   # P1: 즉시 승리
+                if opp_cnt >= 5:          return r * bs + c   # P2: 즉시 차단
+                if my_cnt == 4 and my_four is None:
+                    my_four = r * bs + c
+                if opp_cnt == 4 and opp_four is None:
+                    opp_four = r * bs + c
+
+        if my_four  is not None: return my_four   # P3: 내 4목 완성
+        if opp_four is not None: return opp_four  # P4: 상대 4목 차단
+        return None
 
     def select_action(self, state):
         """
-        state : 2D numpy 배열 (15×15), 반전된 뷰 (자신=1, 상대=2)
-
-        전처리: train.py board_to_cnn_obs()와 동일하게
-                (3, 15, 15) float32 CNN 입력으로 변환 후 predict.
-        마스킹: (225,) bool valid_mask 를 action_masks 로 그대로 전달.
+        state: 2D numpy 배열 (15×15), 반전된 뷰 (자신=1, 상대=2)
         """
-        obs_flat = state.flatten()          # (225,) int
-        valid    = np.where(obs_flat == 0)[0]
+        obs_flat = state.flatten()
+        valid = np.where(obs_flat == 0)[0]
         if len(valid) == 0:
             return 0
 
+        # 모델 없으면 전체 규칙 기반으로 폴백
         if self.model is None:
-            return int(np.random.choice(valid))
+            return self._heuristic.select_action(state)
 
-        # ── board_to_cnn_obs()와 동일한 전처리 ──────────────────────
+        # 1순위: 즉시 승리 or 상대 5목 차단 (규칙 강제 적용)
+        critical = self._critical_move(state)
+        if critical is not None:
+            print(f"[{self.name}] 긴급 착수(규칙): {critical} (행={critical // 15}, 열={critical % 15})")
+            return critical
+
+        # 2순위: RL 모델 예측
         obs_cnn = np.stack([
             (state == 1).astype(np.float32),  # Ch0: 내 돌
             (state == 2).astype(np.float32),  # Ch1: 상대 돌
             (state == 0).astype(np.float32),  # Ch2: 빈칸
-        ], axis=0)                            # (3, 15, 15)
+        ], axis=0)  # (3, 15, 15)
 
-        # ── Action Masking: 빈칸(0)만 True 인 (225,) bool 배열 ──────
         valid_mask = (obs_flat == 0)
 
         try:
             action, _ = self.model.predict(obs_cnn, deterministic=True, action_masks=valid_mask)
         except TypeError:
-            # sb3_contrib 없이 일반 PPO 로 로드된 경우 폴백
             action, _ = self.model.predict(obs_cnn, deterministic=True)
         action = int(action)
 
-        # 유효하지 않은 수 예측 시 랜덤 폴백
         if obs_flat[action] != 0:
-            print(f"[{self.name}] 유효하지 않은 수({action}) 예측 → 랜덤 폴백")
-            action = int(np.random.choice(valid))
-        else:
-            print(f"[{self.name}] 착수: {action} (행={action // 15}, 열={action % 15})")
+            print(f"[{self.name}] 유효하지 않은 수({action}) → 규칙 기반 폴백")
+            return self._heuristic.select_action(state)
 
+        print(f"[{self.name}] 착수(RL): {action} (행={action // 15}, 열={action % 15})")
         return action
 
 # ==========================================
@@ -244,7 +352,12 @@ class Agent2:
 def main():
     env = OmokEnvGUI(render_mode="human")
     agent1 = HumanAgent(env, name="Human_Black(●)")
-    agent2 = Agent2()
+
+    # ── AI 선택 ─────────────────────────────────────────────────────
+    # RL 모델이 잘 학습됐을 때: Agent2()          (RL + 규칙 하이브리드)
+    # RL 모델 없이 규칙만 사용: AgentHeuristic()  (즉시 강한 플레이)
+    agent2 = Agent2()                    # omok_model.zip 사용 (학습 완료 후 자동 저장)
+    # agent2 = AgentHeuristic()          # RL 없이 규칙만 사용 시
     
     state, info = env.reset()
     env.render()

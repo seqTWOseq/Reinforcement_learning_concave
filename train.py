@@ -202,9 +202,10 @@ class OpponentHolder:
         if self.use_heuristic:
             return self._heuristic_bot.get_action(board.copy(), player=2)
 
-        # Self-Play: 체크포인트 모델 없으면 랜덤
-        if self.model is None or np.random.random() < 0.05:
-            return int(np.random.choice(np.where(valid_mask)[0]))
+        # Self-Play: 30% 확률로 HeuristicBot 유지 (3목 차단 학습 신호 공급)
+        # → 에이전트가 3목을 만들면 반드시 막히는 경험을 꾸준히 제공
+        if self.model is None or np.random.random() < 0.30:
+            return self._heuristic_bot.get_action(board.copy(), player=2)
 
         # 상대방 관점 (색상 반전) CNN 입력
         inv_board = np.where(board == 1, 2, np.where(board == 2, 1, 0)).astype(np.int8)
@@ -278,7 +279,21 @@ class OmokTrainEnv(gym.Env):
         # ── [B] 에이전트 착수 보상 계산 ─────────────────────────────
         r, c = action // self.bs, action % self.bs
         my_count = self._max_consecutive(obs, r, c, player=1)
-        my_reward = {3: 0.5, 4: 2.0}.get(min(my_count, 4), 0.0)
+        my_reward = {3: 1.0, 4: 2.0}.get(min(my_count, 4), 0.0)
+
+        # ── [B2] 무적수 보상: 쌍삼(33) / 사삼(43) / 쌍사(44) ─────────
+        # 돌 하나로 두 방향 이상에서 동시에 위협을 만들면 상대가 막을 수 없음
+        three_dirs = self._count_threats(obs, r, c, player=1, threshold=3)
+        four_dirs  = self._count_threats(obs, r, c, player=1, threshold=4)
+
+        if four_dirs >= 2:                        # 쌍사(44): 최강 무적수
+            multi_threat_reward = 4.0
+        elif four_dirs == 1 and three_dirs >= 2:  # 사삼(43): 강한 무적수
+            multi_threat_reward = 3.0
+        elif three_dirs >= 2:                     # 쌍삼(33): 기본 무적수
+            multi_threat_reward = 2.0
+        else:
+            multi_threat_reward = 0.0
 
         # ── [C] 차단 보상: 이 자리에 상대가 놓았다면? ───────────────
         tmp = board_before.copy()
@@ -286,7 +301,7 @@ class OmokTrainEnv(gym.Env):
         blocked_count = self._max_consecutive(tmp, r, c, player=2)
         if blocked_count >= 5:   block_reward = 5.0   # 상대 승리수 차단!
         elif blocked_count == 4: block_reward = 2.5
-        elif blocked_count == 3: block_reward = 0.8
+        elif blocked_count == 3: block_reward = 2.2   # 1.5 → 2.2: 3목 차단 추가 강화
         else:                    block_reward = 0.0
 
         # ── [D] 상대방 응수 ──────────────────────────────────────────
@@ -302,10 +317,19 @@ class OmokTrainEnv(gym.Env):
         if terminated:
             winner = info.get("winner", 0)
             opp_reward = -10.0 if winner == 2 else 0.0
+            threat_penalty = 0.0
         else:
             opp_reward = 0.0
+            # ── [E] 차단 실패 패널티: 상대가 3목+ 완성 시 즉시 페널티 ──
+            # 차단 보상(양수)만으로는 학습 불충분 → 실패 신호(음수)로 보완
+            opp_r = opp_action // self.bs
+            opp_c = opp_action % self.bs
+            opp_consec = self._max_consecutive(obs, opp_r, opp_c, player=2)
+            if opp_consec >= 4:   threat_penalty = -6.0   # -3.0 → -6.0 (4목 방치 = 거의 패배)
+            elif opp_consec == 3: threat_penalty = -4.0   # -2.0 → -4.0 (3목 방치 강한 경고)
+            else:                 threat_penalty = 0.0
 
-        final_reward = my_reward + block_reward + opp_reward
+        final_reward = my_reward + block_reward + multi_threat_reward + opp_reward + threat_penalty
         return board_to_cnn_obs(obs), final_reward, terminated, truncated, info
 
     # ── Action Masking (MaskablePPO 전용) ───────────────────────────
@@ -323,6 +347,24 @@ class OmokTrainEnv(gym.Env):
                     cnt += 1; nr += dr * s; nc += dc * s
             best = max(best, cnt)
         return best
+
+    def _count_threats(self, board_2d: np.ndarray, r: int, c: int,
+                       player: int, threshold: int) -> int:
+        """
+        (r,c)에 player 돌이 놓인 상태에서, threshold 이상의 연속수가
+        나오는 방향이 몇 개인지 반환.
+        쌍삼·사삼·쌍사 감지에 사용.
+        """
+        count = 0
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (-1, 1)]:
+            cnt = 1
+            for s in (1, -1):
+                nr, nc = r + dr * s, c + dc * s
+                while 0 <= nr < self.bs and 0 <= nc < self.bs and board_2d[nr, nc] == player:
+                    cnt += 1; nr += dr * s; nc += dc * s
+            if cnt >= threshold:
+                count += 1
+        return count
 
     def render(self): pass
     def close(self): self._env.close()
@@ -407,9 +449,12 @@ if __name__ == "__main__":
     print("=" * 55)
 
     # ── 커리큘럼 설정 ────────────────────────────────────────────────
-    TOTAL_TIMESTEPS = 10_000_000          # 총 1000만 스텝
-    PHASE2_START    = TOTAL_TIMESTEPS // 2  # 50% 지점에서 Self-Play 전환
-    SELFPLAY_FREQ   = 300_000             # Phase 2에서 300k 스텝마다 상대방 교체
+    # [3목 차단 집중 학습]
+    # 5M 최고 모델에서 이어서, Self-Play 없이 HeuristicBot 100%로 3M 추가 학습
+    # → HeuristicBot은 항상 3목을 확장하므로 차단 학습 신호가 지속 발생
+    TOTAL_TIMESTEPS = 8_000_000           # 5M 체크포인트 기준 +3M 추가 (~1.5시간)
+    PHASE2_START    = 99_999_999          # Self-Play 진입 비활성화 (HeuristicBot 100%)
+    SELFPLAY_FREQ   = 100_000
 
     # ── 상대방 컨테이너 생성 ────────────────────────────────────────
     holder = OpponentHolder()
@@ -428,9 +473,18 @@ if __name__ == "__main__":
     # ── 모델 초기화 (체크포인트 자동 감지) ──────────────────────────
     print("\n[2/3] 모델 초기화 중...")
 
+    # ── 5M 체크포인트 명시적 고정 ────────────────────────────────────
+    # 9M 모델은 HeuristicBot 30% 혼합으로 퇴보(ep_rew_mean=-5.88)
+    # → 5M(ep_rew_mean=37, explained_variance=0.15) 에서 재출발
+    FIXED_CKPT = "./checkpoints/omok_ppo_5000000_steps.zip"
+
     latest_ckpt = None
     ckpt_steps  = 0
-    if os.path.isdir("./checkpoints"):
+    if os.path.isfile(FIXED_CKPT):
+        latest_ckpt = FIXED_CKPT
+        ckpt_steps  = 5_000_000
+        print(f"  [체크포인트 고정] {FIXED_CKPT}")
+    elif os.path.isdir("./checkpoints"):
         zips = sorted(
             [f for f in os.listdir("./checkpoints") if f.endswith(".zip")],
             key=lambda f: os.path.getmtime(os.path.join("./checkpoints", f)),
@@ -447,17 +501,18 @@ if __name__ == "__main__":
             policy="CnnPolicy",
             env=vec_env,
             verbose=1,
-            learning_rate=3e-4,
-            n_steps=2048,
+            learning_rate=0.00005,  # 0.0001 → 0.00005: 안정적 수렴
+            n_steps=4096,
             batch_size=512,
-            n_epochs=10,
+            n_epochs=5,             # 10 → 5: 과적합 방지, 가치함수 안정화
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=0.1,
             ent_coef=0.02,
-            vf_coef=0.5,
+            vf_coef=2.0,            # 1.0 → 2.0: 가치함수 학습 강화 (explained_variance 음수 수정)
             max_grad_norm=0.5,
             device=DEVICE,
+            target_kl=0.015,        # 0.03 → 0.015: KL 더 엄격하게 제한
             policy_kwargs=dict(
                 features_extractor_class=OmokCNN,
                 features_extractor_kwargs=dict(features_dim=512),
@@ -470,14 +525,11 @@ if __name__ == "__main__":
     if latest_ckpt:
         try:
             model = MaskablePPO.load(latest_ckpt, env=vec_env)
+            model.ent_coef = 0.05   # 탐색 약간 늘려 새 패널티 구조 적응
             reset_num_timesteps = False
+            holder.use_heuristic = True   # Self-Play 비활성화: HeuristicBot 100% 고정
             print(f"  체크포인트 로드 성공 ({ckpt_steps:,} steps) → 이어서 학습")
-            if ckpt_steps >= PHASE2_START:
-                holder.use_heuristic = False
-                print("  → Phase 2 (Self-Play) 모드로 바로 재개")
-            else:
-                print(f"  → Phase 1 (휴리스틱 봇) 재개 "
-                      f"(Phase 2까지 약 {PHASE2_START - ckpt_steps:,} 스텝 남음)")
+            print(f"  → [3목 차단 집중] Phase 1 전용 (HeuristicBot 100%, Self-Play 없음)")
         except ValueError as e:
             # 관찰값 공간 불일치(MLP→CNN 전환 등) → 새 모델로 시작
             print(f"  ⚠️  체크포인트 호환 불가 → 새 모델로 시작합니다.")
@@ -505,8 +557,11 @@ if __name__ == "__main__":
     # ── 학습 실행 ────────────────────────────────────────────────────
     remaining = max(TOTAL_TIMESTEPS - ckpt_steps, 1_000_000)
     print(f"\n[3/3] 학습 시작 — 총 {remaining:,} 타임스텝")
-    print(f"  Phase 1 (휴리스틱 봇):  0 ~ {PHASE2_START:,} steps")
-    print(f"  Phase 2 (Self-Play):    {PHASE2_START:,} ~ {TOTAL_TIMESTEPS:,} steps\n")
+    if PHASE2_START >= TOTAL_TIMESTEPS:
+        print(f"  Phase 1 (휴리스틱 봇):  전 구간 고정 (Self-Play 비활성화)\n")
+    else:
+        print(f"  Phase 1 (휴리스틱 봇):  0 ~ {PHASE2_START:,} steps")
+        print(f"  Phase 2 (Self-Play):    {PHASE2_START:,} ~ {TOTAL_TIMESTEPS:,} steps\n")
 
     model.learn(
         total_timesteps=remaining,
