@@ -383,7 +383,7 @@ class KhyAgent:
         self.epsilon_decay = 0.999
         
         # 경험 재생 메모리
-        self.memory = deque(maxlen=100000)
+        self.memory = deque(maxlen=50000)
         self.batch_size = 1024
         self.gamma = 0.99
 
@@ -616,7 +616,7 @@ def main():
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
-    agent1.load_model("khy_omok_gen1_final.pth")
+    agent1.load_model("khy_omok_ep5000.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -823,5 +823,5 @@ def train_main():
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    # main()
-    train_main()
+    main()
+    # train_main()
