@@ -229,6 +229,9 @@ class AlphaZeroTrainer:
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_loss = 0.0
+        total_policy_correct = 0
+        total_value_outcome_correct = 0
+        total_value_abs_error = 0.0
         total_samples = 0
 
         try:
@@ -251,6 +254,32 @@ class AlphaZeroTrainer:
                     self.optimizer.step()
 
                     batch_size = state.shape[0]
+                    predicted_actions = policy_logits.argmax(dim=1)
+                    target_actions = policy_target.argmax(dim=1)
+                    total_policy_correct += int((predicted_actions == target_actions).sum().item())
+
+                    value_pred_flat = value_pred.squeeze(1)
+                    value_target_flat = value_target.squeeze(1)
+                    predicted_outcome = torch.where(
+                        value_pred_flat > 0.33,
+                        torch.ones_like(value_pred_flat),
+                        torch.where(
+                            value_pred_flat < -0.33,
+                            -torch.ones_like(value_pred_flat),
+                            torch.zeros_like(value_pred_flat),
+                        ),
+                    )
+                    target_outcome = torch.where(
+                        value_target_flat > 0.0,
+                        torch.ones_like(value_target_flat),
+                        torch.where(
+                            value_target_flat < 0.0,
+                            -torch.ones_like(value_target_flat),
+                            torch.zeros_like(value_target_flat),
+                        ),
+                    )
+                    total_value_outcome_correct += int((predicted_outcome == target_outcome).sum().item())
+                    total_value_abs_error += float(torch.abs(value_pred_flat - value_target_flat).sum().item())
                     total_samples += batch_size
                     total_policy_loss += float(policy_loss.item()) * batch_size
                     total_value_loss += float(value_loss.item()) * batch_size
@@ -266,6 +295,9 @@ class AlphaZeroTrainer:
             "policy_loss": total_policy_loss / total_samples,
             "value_loss": total_value_loss / total_samples,
             "total_loss": total_loss / total_samples,
+            "policy_top1_accuracy": total_policy_correct / total_samples,
+            "value_outcome_accuracy": total_value_outcome_correct / total_samples,
+            "value_mae": total_value_abs_error / total_samples,
             # This is the current buffered sample-entry count, not an
             # epoch-multiplied processed-example total.
             "num_training_samples": float(len(samples)),
@@ -317,6 +349,7 @@ class AlphaZeroTrainer:
             "format_version": TRAINER_CHECKPOINT_FORMAT_VERSION,
             "checkpoint_type": TRAINER_CHECKPOINT_TYPE,
             "model_state_dict": self.model.state_dict(),
+            "model_config": asdict(self.model.config),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "trainer_config": asdict(self.trainer_config),
             "cycle_index": cycle_index,

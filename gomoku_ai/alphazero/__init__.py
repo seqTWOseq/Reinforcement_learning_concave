@@ -6,6 +6,7 @@ from gomoku_ai.alphazero.checkpoint_manager import (
     load_best_model_checkpoint,
     save_best_model_checkpoint,
 )
+from gomoku_ai.alphazero.checkpoint_loader import load_model_for_inference, resolve_model_checkpoint_path
 from gomoku_ai.alphazero.evaluation import AlphaZeroEvaluator, EvaluationConfig, EvaluationResult
 from gomoku_ai.alphazero.evaluation_utils import (
     build_evaluation_mcts_config,
@@ -58,6 +59,14 @@ from gomoku_ai.alphazero.trainer_utils import (
     compute_policy_loss,
     compute_value_loss,
     trim_samples,
+)
+from gomoku_ai.alphazero.training_dashboard import (
+    append_training_log_entry,
+    build_training_log_entry,
+    load_training_log_entries,
+    summarize_self_play_records,
+    write_training_dashboard,
+    write_training_dashboard_from_log,
 )
 from gomoku_ai.alphazero.utils import (
     build_game_step_sample,
@@ -116,6 +125,7 @@ __all__ = [
     "finalize_human_ai_turn_records",
     "get_temperature_for_move",
     "load_best_model_checkpoint",
+    "load_model_for_inference",
     "load_policy_value_net",
     "mask_policy_logits",
     "maybe_extract_ai_turn_samples",
@@ -126,9 +136,16 @@ __all__ = [
     "predict_single",
     "resolve_human_and_ai_colors",
     "resolve_env_player_to_move",
+    "resolve_model_checkpoint_path",
     "save_best_model_checkpoint",
     "save_policy_value_net",
+    "append_training_log_entry",
+    "build_training_log_entry",
+    "load_training_log_entries",
+    "summarize_self_play_records",
     "terminal_value_for_player",
     "trim_samples",
+    "write_training_dashboard",
+    "write_training_dashboard_from_log",
     "winner_to_value_target",
 ]
