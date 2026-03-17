@@ -13,6 +13,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import time
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from khy_model import DualHeadResOmokCNN
 
@@ -153,13 +154,19 @@ class HumanAgent:
                 self.clicked_action = action
 
 class HeuristicAgent:
-    def __init__(self, name="Heuristic_AI"):
+    def __init__(self, name="Heuristic_AI", mistake_prob=0.3):
         self.name = name
+        self.mistake_prob = mistake_prob
 
-    def select_action(self, state):
+    def select_action(self, state, move_count=0, **kwargs):
         board_size = state.shape[0]
         valid_moves = np.where(state.flatten() == 0)[0]
         if len(valid_moves) == 0: return 0
+
+        # [추가] 실수 로직: 설정된 확률에 따라 완전히 무작위로 착수
+        # AI에게 "빈틈"을 만들어주는 핵심 장치입니다.
+        if random.random() < self.mistake_prob:
+            return np.random.choice(valid_moves)
 
         # 보드가 비어있다면 중앙(7, 7)에 착수
         if np.sum(state != 0) == 0:
@@ -168,7 +175,7 @@ class HeuristicAgent:
         best_score = -float('inf')
         best_actions = []
 
-        # 연산 시간을 줄이기 위해 기존 돌 주변 반경 2칸 이내의 빈칸만 탐색 후보로 선정
+        # 기존 돌 주변 탐색 (반경 2칸으로 최적화)
         candidates = self._get_candidate_moves(state, board_size)
         if not candidates:
             candidates = valid_moves
@@ -176,29 +183,29 @@ class HeuristicAgent:
         for action in candidates:
             r, c = action // board_size, action % board_size
             
-            # 내가 착수했을 때의 공격 점수 (Player 1 기준)
+            # 내가 착수했을 때의 공격 점수 (현재 플레이어 기준)
             offense_score = self._evaluate_position(state, r, c, player=1)
-            # 상대가 착수했을 때의 방어 점수 (Player 2 기준)
+            # 상대가 착수했을 때의 방어 점수 (상대 플레이어 기준)
             defense_score = self._evaluate_position(state, r, c, player=2)
             
-            # 방어에 약간의 가중치를 더 주어 안정적으로 플레이 (1.1배)
-            total_score = offense_score + (defense_score * 1.1)
+            # 방어 가중치를 높여서 AI의 공격을 끈질기게 막도록 유도
+            total_score = offense_score + (defense_score * 1.2)
 
             if total_score > best_score:
                 best_score = total_score
                 best_actions = [action]
             elif total_score == best_score:
-                best_actions.append(action) # 동점일 경우 후보에 추가
+                best_actions.append(action)
 
-        # 동점인 행동 중 무작위 선택하여 패턴 고착화 방지
         return np.random.choice(best_actions)
 
     def _get_candidate_moves(self, state, board_size):
         candidates = set()
         occupied = np.argwhere(state != 0)
+        # 반경 2칸 이내면 오목의 모든 주요 패턴을 커버하기에 충분합니다. (연산량 절감)
         for r, c in occupied:
-            for dr in range(-4, 5):
-                for dc in range(-4, 5):
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
                     nr, nc = r + dr, c + dc
                     if 0 <= nr < board_size and 0 <= nc < board_size and state[nr, nc] == 0:
                         candidates.add(nr * board_size + nc)
@@ -213,7 +220,7 @@ class HeuristicAgent:
             consecutive = 1
             open_ends = 0
 
-            # 양방향 탐색
+            # 양방향 탐색 로직은 그대로 유지하되 가중치 밸런스 조정
             for step in (1, -1):
                 r, c = row + dr * step, col + dc * step
                 while 0 <= r < board_size and 0 <= c < board_size:
@@ -221,9 +228,9 @@ class HeuristicAgent:
                         consecutive += 1
                     elif state[r, c] == 0:
                         open_ends += 1
-                        break # 빈칸을 만나면 열린 끝으로 간주하고 중단
+                        break
                     else:
-                        break # 상대 돌을 만나면 막힌 것으로 간주하고 중단
+                        break
                     r += dr * step
                     c += dc * step
 
@@ -433,7 +440,7 @@ class KhyAgent:
             policy_scaled = policy_probs
 
         # Rollout Q-Value
-        num_simulations = 800
+        num_simulations = 400
         action_visits = np.zeros(total_grids)
         action_wins = np.zeros(total_grids)
 
@@ -523,17 +530,17 @@ class KhyAgent:
                 
                 # 1.0 스케일에 맞춘 점수 재조정
                 if consecutive >= 5:
-                    score += 1.0       # 승리/패배 직결 (최고점)
+                    score += 0.5      # 승리/패배 직결 (최고점)
                 elif consecutive == 4 and open_ends >= 1:
-                    score += 0.4       # 열린 4목 (매우 높음)
+                    score += 0.2      # 열린 4목 (매우 높음)
                     pattern_counts['four'] += 1
                 elif consecutive == 3 and open_ends == 2:
-                    score += 0.15       # 열린 3목
+                    score += 0.08       # 열린 3목
                     pattern_counts['open_3'] += 1
             
             # 양수겸장 판단 (최대 1.0을 넘지 않도록 조정)
             if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
-                score = max(score, 0.5)
+                score = max(score, 0.25)
                 
             return score
 
@@ -606,7 +613,7 @@ class KhyAgent:
         policy_loss = F.cross_entropy(policy_logits, actions_tensor)
         
         # [핵심] 두 Loss를 합치되, 스케일에 따라 가중치(예: c=1.0)를 둘 수 있습니다.
-        total_loss = value_loss + policy_loss
+        total_loss = (value_loss * 1*5) + policy_loss
 
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -646,7 +653,7 @@ def main():
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
-    # agent1.load_model("khy_omok_final.pth")
+    agent1.load_model("khy_omok_gen2_final.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -684,25 +691,55 @@ def main():
     env.close()
 
 # ===================================================================    
+plt.rcParams['axes.unicode_minus'] = False
+
+class LivePlotter:
+    def __init__(self, title="Real-time Training Status"):
+        plt.ion()  # 대화형 모드 활성화 (창이 떠 있는 상태로 코드 진행 가능)
+        self.fig, self.ax = plt.subplots(figsize=(8, 5))
+        self.v_losses, self.p_losses = [], []
+        self.ax.set_title(title)
+        self.ax.set_xlabel("Episode")
+        self.ax.set_ylabel("Loss")
+        self.line_v, = self.ax.plot([], [], label="Value Loss", color='blue', alpha=0.6)
+        self.line_p, = self.ax.plot([], [], label="Policy Loss", color='red', alpha=0.6)
+        self.ax.legend()
+
+    def update(self, v_loss, p_loss):
+        self.v_losses.append(v_loss)
+        self.p_losses.append(p_loss)
+        
+        # 데이터 업데이트
+        x_data = range(len(self.v_losses))
+        self.line_v.set_data(x_data, self.v_losses)
+        self.line_p.set_data(x_data, self.p_losses)
+        
+        # 화면 축 자동 조정 및 갱신
+        self.ax.relim()
+        self.ax.autoscale_view()
+        
+        plt.pause(0.5) # 짧게 멈춰서 그래프 그릴 시간 확보
+        plt.draw()
 
 def train_main():
     env = OmokEnvGUI(render_mode=None)
     
     # [추가] 텐서보드 Writer 초기화 (실행할 때마다 runs 폴더 내에 기록됨)
     writer = SummaryWriter("runs/omok_training_v1")
+    plotter = LivePlotter(title="Real-time Training Status")
     
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    # agent1.load_model("khy_omok_final.pth")
+    agent1.load_model("khy_omok_gen2_final.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
     # 셀프 대결을 위한 상대방 에이전트 (과거의 나)
     model2 = DualHeadResOmokCNN()
-    agent2_self = KhyAgent(model2)
-    agent2_self.model.load_state_dict(agent1.model.state_dict())
-    agent2_self.eval_mode()
+    agent2_self = HeuristicAgent()
+    # agent2_self.model.load_state_dict(agent1.model.state_dict())
+    # agent2_self.eval_mode()
     
     N = 10
     EPISODES = 10000
@@ -808,6 +845,9 @@ def train_main():
                     ep_p_loss /= valid_trains
                     writer.add_scalar("1_Loss/Value_Loss", ep_v_loss, global_episode)
                     writer.add_scalar("1_Loss/Policy_Loss", ep_p_loss, global_episode)
+                    
+                    if global_episode % 10 == 0:
+                        plotter.update(ep_v_loss, ep_p_loss)
 
                 # --- 통계 계산 ---
                 current_phase_ep = episode - phase_start + 1
@@ -859,6 +899,9 @@ def train_main():
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
     writer.close() # [추가] 모든 학습 완료 시 텐서보드 Writer 닫기
     env.close()
+    
+    plt.ioff()
+    plt.show()
     
 # ==========================================
 # 4. 메인
