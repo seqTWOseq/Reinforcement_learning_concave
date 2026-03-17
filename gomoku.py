@@ -360,6 +360,8 @@ class KhyAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+
+        self.is_training = True
         
         # 탐험 파라미터
         self.epsilon = 1.0
@@ -371,6 +373,7 @@ class KhyAgent:
         self.batch_size = 1024
         self.gamma = 0.99
 
+    # ====================
     # 행동 선택 로직
     def select_action(self, state, move_count=0):
         board_size = state.shape[0]
@@ -382,9 +385,9 @@ class KhyAgent:
         
         occupied = np.argwhere(state != 0)
         if len(occupied) == 0:
-            return (board_size // 2) * board_size + (board_size // 2) 
+            return (board_size // 2) * board_size + (board_size // 2)
         
-        # 인접 빈칸 탐색
+        # 인접 빈칸 탐색, 위급 수 방어
         sensible_moves = set()
         for r, c in occupied:
             for dr in range(-2, 3):
@@ -394,82 +397,96 @@ class KhyAgent:
                         sensible_moves.add(nr * board_size + nc)
         valid_moves = np.array(list(sensible_moves))
             
-        # 위급 수 우선 확인 (Numba 함수 호출)
         urgent_move = find_urgent_move_fast(state, valid_moves, player=1)
         if urgent_move != -1: 
             return urgent_move
 
-        # CNN 가치 및 정책 평가
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
         self.model.eval()
-        with torch.no_grad():
-            policy_logits, value = self.model(state_tensor)
-            policy_logits = policy_logits.squeeze()
-        self.model.train()
 
-        # 불가능 수 마스킹
+        # 현재 상태의 Policy(정책) 평가
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            policy_logits, _ = self.model(state_tensor)
+            policy_logits = policy_logits.squeeze()
+
         valid_mask = torch.ones(total_grids, dtype=torch.bool).to(self.device)
         valid_mask[valid_moves] = False
         policy_logits[valid_mask] = -float('inf')
-
-        # Softmax를 적용해 행동 확률 분포 획득
         policy_probs = F.softmax(policy_logits, dim=0).cpu().numpy()
 
-        # [핵심 수정 1] Epsilon 무작위 탐험을 버리고 알파제로식 디리클레 노이즈 주입
-        if self.model.training:
+        # 탐험을 위한 디리클레 노이즈 주입 (Train 모드일 때만)
+        if self.is_training:
             noise = np.random.dirichlet([0.3] * len(valid_moves))
-            # 기존 신경망의 추천 확률 75%에 상상력(노이즈) 25%를 섞음
             policy_probs[valid_moves] = 0.75 * policy_probs[valid_moves] + 0.25 * noise
-            policy_probs = policy_probs / np.sum(policy_probs[valid_moves]) # 확률 정규화
+            policy_probs /= np.sum(policy_probs[valid_moves])
 
-        # MCTS 시뮬레이션
-        num_simulations = 800 # [핵심 수정 2] 시뮬레이션 횟수 상향 (수읽기 파워 증폭)
+        # Rollout Q-Value
+        num_simulations = 800
         action_visits = np.zeros(total_grids)
         action_wins = np.zeros(total_grids)
 
         for _ in range(num_simulations):
-            # [핵심 수정 3] Epsilon 분기문 완전히 삭제 (오직 신경망의 지능적 확률로만 선택)
             probs = policy_probs[valid_moves]
-            probs = probs / np.sum(probs)
+            probs /= np.sum(probs)
             sim_action = np.random.choice(valid_moves, p=probs)
             
-            # [핵심 수정 4] 깊이 연장 (최대 20수 앞까지 내다봄)
+            # Numba로 최적화된 20수 무작위 롤아웃 실행 (빠른 속도)
             reward = fast_rollout_fast(state, sim_action, max_depth=20)
             action_visits[sim_action] += 1
             action_wins[sim_action] += reward
         
+        # 롤아웃 결과 평균 승률 산출
         sim_q_values = np.divide(action_wins, action_visits, out=np.zeros_like(action_wins), where=action_visits!=0)
+
+        # 가치 일괄 평가
+        num_valid = len(valid_moves)
+        next_states_batch = np.zeros((num_valid, 1, board_size, board_size), dtype=np.float32)
         
-        # 내재적 보상(공격 포메이션)을 계산하여 합산할 배열 준비
+        for i, move in enumerate(valid_moves):
+            r, c = move // board_size, move % board_size
+            next_state = state.copy()
+            next_state[r, c] = 1 
+            # 다음 턴(상대) 시점으로 보드판 정규화 (시점 반전)
+            canonical_next_state = np.where(next_state != 0, 3 - next_state, 0)
+            next_states_batch[i, 0] = canonical_next_state
+            
+        batch_tensor = torch.FloatTensor(next_states_batch).to(self.device)
+        with torch.no_grad():
+            _, next_values = self.model(batch_tensor)
+            next_values = next_values.flatten().cpu().numpy()
+            
+        cnn_values_full = np.zeros(total_grids)
+        # 내 입장에서의 승률로 부호 반전(-)
+        cnn_values_full[valid_moves] = -1.0 * next_values
+
+        # 내재적 보상
         intrinsic_rewards = np.zeros(total_grids)
         for move in valid_moves:
-            # 행동마다 유발되는 공격 + 수비 포메이션 가치 평가
             intrinsic_rewards[move] = self.get_intrinsic_reward(state, move)
-        
-        # Policy와 Rollout Value 결합
-        alpha = 0.4  # 신경망 정책 가중치
-        beta = 0.4   # MCTS 롤아웃 가중치
-        weight_int = 0.2 # 내재적 보상(공격성) 가중치
 
+        w_policy  = 0.2  # 직관의 비중
+        w_rollout = 0.3  # 난전/전술 검증의 비중
+        w_value   = 0.3  # 대국적인 형세 판단의 비중
+        w_int     = 0.2  # 당장의 포메이션(안전) 비중
+
+        # 방문하지 않은 곳도 Value와 Intrinsic, Policy는 평가가 가능하므로 합산
         final_score = np.where(
-            action_visits > 0, 
-            (alpha * policy_probs) + (beta * sim_q_values) + (weight_int * intrinsic_rewards), 
-            policy_probs + (weight_int * intrinsic_rewards) # 롤아웃 안 된 곳도 내재적 보상은 평가
+            np.isin(np.arange(total_grids), valid_moves), 
+            (w_policy * policy_probs) + (w_rollout * sim_q_values) + (w_value * cnn_values_full) + (w_int * intrinsic_rewards), 
+            -float('inf')
         )
-        final_score[~np.isin(np.arange(total_grids), valid_moves)] = -float('inf')
 
-        
         return np.argmax(final_score)
     
+    # ====================
     # 내재적 보상
     def get_intrinsic_reward(self, state, action):
         board_size = state.shape[0]
         r, c = action // board_size, action % board_size
         
-        # 특정 플레이어(나 또는 상대) 입장에서 해당 위치의 패턴 가치를 계산하는 내부 함수
         def evaluate_for_player(target_player):
             sim_state = state.copy()
-            sim_state[r, c] = target_player # 평가하려는 플레이어의 돌을 놓아봄
+            sim_state[r, c] = target_player 
             
             score = 0.0
             directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
@@ -492,33 +509,34 @@ class KhyAgent:
                         nr += dr * step
                         nc += dc * step
                 
-                # 순수 포메이션 가치 평가 (돌이 놓였을 때의 파괴력)
+                # 1.0 스케일에 맞춘 점수 재조정
                 if consecutive >= 5:
-                    score += 2.0  
+                    score += 1.0       # 승리/패배 직결 (최고점)
                 elif consecutive == 4 and open_ends >= 1:
-                    score += 0.8  
+                    score += 0.4       # 열린 4목 (매우 높음)
                     pattern_counts['four'] += 1
                 elif consecutive == 3 and open_ends == 2:
-                    score += 0.2  
+                    score += 0.15       # 열린 3목
                     pattern_counts['open_3'] += 1
             
-            # 양수겸장(3-3, 4-3 등) 평가
+            # 양수겸장 판단 (최대 1.0을 넘지 않도록 조정)
             if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
-                score += 1.5
+                score = max(score, 0.5)
                 
             return score
 
-        # 1. 공격 가치: 내가(1) 두었을 때 얻는 포메이션 점수
+        # 공격 가치 (내가 두었을 때의 파괴력)
         attack_value = evaluate_for_player(1) 
         
-        # 2. 수비 가치: 상대(2)가 두었다면 얻었을 포메이션 점수를 빼앗음
+        # 수비 가치 (상대가 두었을 때의 파괴력을 사전에 차단)
         defense_value = evaluate_for_player(2) 
         
-        # 공격과 수비의 가치를 1.0 대 1.0으로 동등하게 합산
-        total_reward = attack_value + defense_value
+        # 공격과 수비를 합치되, 절대 1.0을 넘지 않도록 강력한 상한선(Clipping) 적용
+        total_reward = min((attack_value * 1.1) + defense_value, 1.0)
         
         return total_reward
     
+    # ====================
     # 기억 장치 (데이터 증강 적용)
     def memorize_episode(self, episode_memory, final_reward):
         discounted_reward = final_reward
@@ -551,6 +569,7 @@ class KhyAgent:
             # 보상이 -1.0 밑으로 무한히 떨어져서 학습이 붕괴되는 것을 방어
             discounted_reward = max(discounted_reward, -1.0)
     
+    # ====================
     # 복습 엔진
     def replay_experience(self):
         if len(self.memory) < self.batch_size:
@@ -578,12 +597,15 @@ class KhyAgent:
         # 외부에서 로깅할 수 있도록 순수 Python float 값으로 반환
         return value_loss.item(), policy_loss.item()
     
+    # ====================
     # 유틸
     def train_mode(self):
         self.model.train()
+        self.is_training = True
     
     def eval_mode(self):
         self.model.eval()
+        self.is_training = False
         self.epsilon = 0.0
     
     def save_model(self, filepath):
@@ -824,5 +846,5 @@ def train_main():
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    # main()
-    train_main()
+    main()
+    # train_main()
