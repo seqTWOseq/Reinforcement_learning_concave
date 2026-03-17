@@ -367,7 +367,7 @@ class KhyAgent:
         
         # 경험 재생 메모리
         self.memory = deque(maxlen=150000)
-        self.batch_size = 512
+        self.batch_size = 1024
         self.gamma = 0.99
 
     # 행동 선택 로직
