@@ -24,6 +24,7 @@ from gomoku_ai.alphazero.human_play_utils import (
 from gomoku_ai.alphazero.mcts import MCTS, MCTSConfig
 from gomoku_ai.alphazero.model import PolicyValueNet
 from gomoku_ai.alphazero.specs import ACTION_SIZE, GameRecord, POLICY_SHAPE, STATE_SHAPE
+from gomoku_ai.common.agents import BaseAgent
 from gomoku_ai.env import BLACK, DRAW, GomokuEnv, WHITE
 
 
@@ -234,6 +235,86 @@ class HumanVsAlphaZeroGameRunner:
             metadata=metadata,
         )
 
+    def play_game_with_agent(
+        self,
+        ai_agent: BaseAgent,
+        human_color: str | int | None = None,
+        human_moves: list[int] | None = None,
+    ) -> GameRecord:
+        """Play one human-vs-agent game through the shared `BaseAgent` interface.
+
+        TODO: Replace one-hot policy targets with Athenan/agent search
+        distributions once a search API is finalized.
+        """
+
+        if not isinstance(ai_agent, BaseAgent):
+            raise TypeError("ai_agent must implement BaseAgent.")
+
+        human_player, ai_player = resolve_human_and_ai_colors(
+            human_color=human_color,
+            default_human_color=self.config.human_color,
+            selection_callback=self._select_human_color,
+        )
+
+        env = self.env_factory()
+        if not isinstance(env, GomokuEnv):
+            raise TypeError("env_factory must create GomokuEnv instances.")
+        env.reset()
+
+        game_id = build_human_play_game_id(self.config.game_id_prefix)
+        move_history: list[int] = []
+        ai_turn_records: list[HumanAITurnRecord] = []
+        scripted_human_moves = iter(human_moves) if human_moves is not None else None
+
+        while not env.done:
+            move_index = len(move_history)
+            if env.current_player == human_player:
+                action = self._get_human_action(env, scripted_human_moves)
+                move_history.append(action)
+                env.apply_move(action)
+                continue
+
+            state = np.asarray(env.encode_state(), dtype=np.float32).copy()
+            policy_target, action = self._select_ai_action_from_agent(env, ai_agent)
+            ai_turn_records.append(
+                HumanAITurnRecord(
+                    state=state,
+                    policy_target=policy_target,
+                    player_to_move=env.current_player,
+                    move_index=move_index,
+                    action_taken=action,
+                )
+            )
+            move_history.append(action)
+            env.apply_move(action)
+
+        if env.winner is None:
+            raise RuntimeError("Human-vs-AI game ended without a resolved winner value.")
+
+        samples = finalize_human_ai_turn_records(ai_turn_records, env.winner, game_id)
+        metadata = {
+            "human_color": human_player,
+            "ai_color": ai_player,
+            "num_moves": len(move_history),
+            "ai_temperature": self.config.ai_temperature,
+            "use_root_noise": self.config.use_root_noise,
+            "ai_num_simulations": self.config.ai_num_simulations,
+            "record_ai_turn_only": self.config.record_ai_turn_only,
+            "ai_driver": "external_agent",
+        }
+        missing_required_keys = [key for key in REQUIRED_HUMAN_PLAY_METADATA_KEYS if key not in metadata]
+        if missing_required_keys:
+            raise RuntimeError(f"Missing required human-play metadata keys: {missing_required_keys}")
+
+        return GameRecord(
+            game_id=game_id,
+            moves=move_history,
+            winner=env.winner,
+            source="human_play",
+            samples=samples,
+            metadata=metadata,
+        )
+
     def _build_ai_mcts_config(self) -> MCTSConfig:
         """Build the evaluation-style MCTS config used for AI turns."""
 
@@ -251,6 +332,22 @@ class HumanVsAlphaZeroGameRunner:
         root = mcts.run(env, model)
         policy_target = mcts.get_action_probs(root, temperature=mcts_config.temperature)
         action = mcts.select_action(root, temperature=mcts_config.temperature)
+        return policy_target, action
+
+    def _select_ai_action_from_agent(
+        self,
+        env: GomokuEnv,
+        ai_agent: BaseAgent,
+    ) -> tuple[np.ndarray, int]:
+        """Call a shared-interface agent and normalize to `(policy_target, action)`."""
+
+        action = int(ai_agent.select_action(env))
+        env.action_to_coord(action)
+        if not env.get_valid_moves()[action]:
+            raise ValueError(f"External AI selected an illegal action: {action}.")
+
+        policy_target = np.zeros(POLICY_SHAPE, dtype=np.float32)
+        policy_target[action] = 1.0
         return policy_target, action
 
     def _get_human_action(
