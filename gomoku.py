@@ -422,6 +422,15 @@ class KhyAgent:
             policy_probs[valid_moves] = 0.75 * policy_probs[valid_moves] + 0.25 * noise
             policy_probs /= np.sum(policy_probs[valid_moves])
 
+        # MinMax 정규화
+        p_min = policy_probs[valid_moves].min()
+        p_max = policy_probs[valid_moves].max()
+
+        if p_max > p_min:
+            policy_scaled = (policy_probs - p_min) / (p_max - p_min)
+        else:
+            policy_scaled = policy_probs
+
         # Rollout Q-Value
         num_simulations = 800
         action_visits = np.zeros(total_grids)
@@ -474,7 +483,7 @@ class KhyAgent:
         # 방문하지 않은 곳도 Value와 Intrinsic, Policy는 평가가 가능하므로 합산
         final_score = np.where(
             np.isin(np.arange(total_grids), valid_moves), 
-            (w_policy * policy_probs) + (w_rollout * sim_q_values) + (w_value * cnn_values_full) + (w_int * intrinsic_rewards), 
+            (w_policy * policy_scaled) + (w_rollout * sim_q_values) + (w_value * cnn_values_full) + (w_int * intrinsic_rewards), 
             -float('inf')
         )
 
