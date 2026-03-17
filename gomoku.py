@@ -281,37 +281,20 @@ def find_urgent_move_fast(state, valid_moves, player):
     board_size = state.shape[0]
     opponent = 3 - player
     best_move = -1
-    best_priority = 5
 
     for i in range(len(valid_moves)):
         move = valid_moves[i]
         r = move // board_size
         c = move % board_size
         
-        # 1순위: 승리 확정
+        # 1순위: 내가 두면 바로 승리 (5목 완성)
         if check_pattern_fast(state, r, c, player, 5, 0):
             return move
         
-        # 2순위: 상대 승리 방어
-        if best_priority > 2 and check_pattern_fast(state, r, c, opponent, 5, 0):
+        # 2순위: 상대가 두면 바로 패배 (상대 5목 완성 차단)
+        # 단, 내가 당장 이길 수 있는 수가 있다면 그게 우선이므로 1순위 아래에 배치
+        if best_move == -1 and check_pattern_fast(state, r, c, opponent, 5, 0):
             best_move = move
-            best_priority = 2
-            continue
-        
-        # 3순위: 상대 양수겸장 차단
-        if best_priority > 3:
-            threat_count = 0
-            if check_pattern_fast(state, r, c, opponent, 4, 0): threat_count += 1
-            if check_pattern_fast(state, r, c, opponent, 3, 2): threat_count += 1
-            if threat_count >= 2:
-                best_move = move
-                best_priority = 3
-                continue
-        
-        # 4순위: 상대 열린 4목 방어
-        if best_priority > 4 and check_pattern_fast(state, r, c, opponent, 4, 2):
-            best_move = move
-            best_priority = 4
 
     return best_move
 
@@ -384,7 +367,7 @@ class KhyAgent:
         
         # 경험 재생 메모리
         self.memory = deque(maxlen=150000)
-        self.batch_size = 1024
+        self.batch_size = 512
         self.gamma = 0.99
 
     # 행동 선택 로직
@@ -411,9 +394,9 @@ class KhyAgent:
         valid_moves = np.array(list(sensible_moves))
             
         # 위급 수 우선 확인 (Numba 함수 호출)
-        # urgent_move = find_urgent_move_fast(state, valid_moves, player=1)
-        # if urgent_move != -1: 
-        #     return urgent_move
+        urgent_move = find_urgent_move_fast(state, valid_moves, player=1)
+        if urgent_move != -1: 
+            return urgent_move
 
         # CNN 가치 및 정책 평가
         state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
