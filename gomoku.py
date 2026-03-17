@@ -676,7 +676,7 @@ def train_main():
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_fianl.pth")
+    agent1.load_model("khy_omok_final.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
@@ -838,5 +838,5 @@ def train_main():
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    main()
-    # train_main()
+    # main()
+    train_main()
