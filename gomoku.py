@@ -321,21 +321,21 @@ def fast_rollout_fast(state, action, max_depth, max_moves=100):
     current_player = 2
     depth_penalty_weight = 0.01
 
-    # [최적화 1] 매 턴 np.where를 호출하지 않고, 처음에 한 번만 빈칸 목록을 추출
     valid_moves = np.where(sim_state.flatten() == 0)[0]
     num_valid = len(valid_moves)
 
     for depth in range(max_depth):
+        # 100수 도달 시 (사용자 요청: -0.4)
         if current_stones >= max_moves:
-            return -0.8
+            return -0.4
+            
+        # 판이 꽉 찼을 때 (자연 무승부)
         if num_valid == 0:
-            return 0.0
+            return -0.2 
         
-        # [최적화 3] O(1) 속도로 빈칸 뽑고 삭제하기 (배열 새로고침 방지)
         idx = np.random.randint(num_valid)
         sim_action = valid_moves[idx]
         
-        # 뽑은 빈칸을 배열 맨 뒤의 값과 바꾸고, 길이를 1 줄임 (초고속 삭제 기법)
         valid_moves[idx] = valid_moves[num_valid - 1]
         num_valid -= 1
             
@@ -344,17 +344,18 @@ def fast_rollout_fast(state, action, max_depth, max_moves=100):
         sim_state[sr, sc] = current_player
         current_stones += 1 
         
-        # 승패 확인 (이 연산 하나만 남김)
         if check_pattern_fast(sim_state, sr, sc, current_player, 5, 0):
             penalty = depth * depth_penalty_weight
             if current_player == 1:
-                return 1.0 - penalty 
+                # 늦게 이길수록 보상이 깎여서 100수 제한(-0.4)에 가까워짐
+                return max(-0.39, 1.0 - penalty) 
             else:
-                return -1.0 + penalty 
+                return min(0.39, -1.0 + penalty) 
             
         current_player = 3 - current_player
         
-    return 0.0 # 30수 안쪽에서 승부가 안 나면 일단 무승부(판단 유보) 처리
+    # 메모리의 무승부 기준(-0.2)을 반환하여 중립적인 가치를 부여
+    return -0.2
     
 class KhyAgent:
     def __init__(self, model):
