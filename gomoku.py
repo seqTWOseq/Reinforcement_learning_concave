@@ -383,7 +383,7 @@ class KhyAgent:
         self.epsilon_decay = 0.999
         
         # 경험 재생 메모리
-        self.memory = deque(maxlen=50000)
+        self.memory = deque(maxlen=150000)
         self.batch_size = 1024
         self.gamma = 0.99
 
