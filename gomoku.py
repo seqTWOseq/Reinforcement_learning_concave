@@ -278,10 +278,11 @@ def check_pattern_fast(state, r, c, player, target, open_ends_req):
 
 @njit
 def find_urgent_move_fast(state, valid_moves, player):
-    """C언어 속도로 동작하는 위급 수 탐색 함수 (Numba는 None을 쓸 수 없어 -1 반환)"""
+    """수정 전: 4단계 우선순위를 가진 규칙 기반 탐색"""
     board_size = state.shape[0]
     opponent = 3 - player
     best_move = -1
+    best_priority = 5  # 낮을수록 우선순위가 높음
 
     for i in range(len(valid_moves)):
         move = valid_moves[i]
@@ -290,14 +291,57 @@ def find_urgent_move_fast(state, valid_moves, player):
         
         # 1순위: 내가 두면 바로 승리 (5목 완성)
         if check_pattern_fast(state, r, c, player, 5, 0):
-            return move
+            return move  # 즉시 최선책 반환
         
-        # 2순위: 상대가 두면 바로 패배 (상대 5목 완성 차단)
-        # 단, 내가 당장 이길 수 있는 수가 있다면 그게 우선이므로 1순위 아래에 배치
-        if best_move == -1 and check_pattern_fast(state, r, c, opponent, 5, 0):
+        # 2순위: 상대 승리(5목) 방어
+        if best_priority > 2 and check_pattern_fast(state, r, c, opponent, 5, 0):
             best_move = move
+            best_priority = 2
+            continue
+        
+        # 3순위: 상대 양수겸장(3-3, 4-3 등) 차단
+        if best_priority > 3:
+            threat_count = 0
+            # 4목(한쪽 뚫림)이 되는 자리인지 확인
+            if check_pattern_fast(state, r, c, opponent, 4, 0): threat_count += 1
+            # 열린 3목이 되는 자리인지 확인
+            if check_pattern_fast(state, r, c, opponent, 3, 2): threat_count += 1
+            
+            # 공격로가 2개 이상 겹치는 '급소'라면 방어
+            if threat_count >= 2:
+                best_move = move
+                best_priority = 3
+                continue
+        
+        # 4순위: 상대 열린 4목 방어 (안 막으면 다음 턴에 확정 패배)
+        if best_priority > 4 and check_pattern_fast(state, r, c, opponent, 4, 2):
+            best_move = move
+            best_priority = 4
 
     return best_move
+
+# @njit
+# def find_urgent_move_fast(state, valid_moves, player):
+#     """C언어 속도로 동작하는 위급 수 탐색 함수 (Numba는 None을 쓸 수 없어 -1 반환)"""
+#     board_size = state.shape[0]
+#     opponent = 3 - player
+#     best_move = -1
+
+#     for i in range(len(valid_moves)):
+#         move = valid_moves[i]
+#         r = move // board_size
+#         c = move % board_size
+        
+#         # 1순위: 내가 두면 바로 승리 (5목 완성)
+#         if check_pattern_fast(state, r, c, player, 5, 0):
+#             return move
+        
+#         # 2순위: 상대가 두면 바로 패배 (상대 5목 완성 차단)
+#         # 단, 내가 당장 이길 수 있는 수가 있다면 그게 우선이므로 1순위 아래에 배치
+#         if best_move == -1 and check_pattern_fast(state, r, c, opponent, 5, 0):
+#             best_move = move
+
+#     return best_move
 
 @njit
 def fast_rollout_fast(state, action, max_depth, max_moves=800):
@@ -834,5 +878,5 @@ def train_main():
 # 4. 메인
 # ==========================================
 if __name__ == "__main__":
-    # main()
-    train_main()
+    main()
+    # train_main()
