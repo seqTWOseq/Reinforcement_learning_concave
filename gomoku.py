@@ -3,6 +3,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import tkinter as tk
 import time
+from sb3_contrib import MaskablePPO
 
 # ==========================================
 # 1. 오목 강화학습 환경 (GUI 포함)
@@ -37,9 +38,9 @@ class OmokEnvGUI(gym.Env):
         """에이전트의 행동을 적용하고 상태, 보상, 종료 여부를 반환합니다."""
         r, c = action // self.board_size, action % self.board_size
         
-        # 1. 반칙 (이미 돌이 있는 곳) 처리
+        # 1. 반칙 (이미 돌이 있는 곳) 처리: 게임을 끝내지 않고, 같은 플레이어가 다시 두도록 유지
         if self.board[r, c] != 0:
-            return self.board.copy(), -10.0, True, False, {"reason": "invalid_move", "winner": 3 - self.current_player}
+            return self.board.copy(), -1.0, False, False, {"reason": "invalid_move", "current_player": self.current_player}
 
         # 2. 착수 및 승리/무승부 판정
         self.board[r, c] = self.current_player
@@ -153,16 +154,30 @@ class Agent1:
         return np.random.choice(valid) if len(valid) > 0 else 0
 
 class Agent2:
-    """중앙(7, 7)과 가장 가까운 빈칸에 착수하는 에이전트"""
-    def __init__(self, name="Center_White(○)"): self.name = name
+    def __init__(self, model_path="omok_resnet_ultimate", name="MaskablePPO_AI(🤖)"):
+        self.name = name
+        try:
+            self.model = MaskablePPO.load(model_path, device="auto")
+            print(f"✅ '{model_path}' 모델을 불러왔습니다!")
+        except Exception as e:
+            print(f"❌ 모델 로드 실패: {e}")
+            self.model = None
     def select_action(self, state):
-        board_size, center = state.shape[0], state.shape[0] // 2
-        valid = np.where(state.flatten() == 0)[0]
-        if len(valid) == 0: return 0
-        
-        # 맨해튼 거리가 가장 짧은 액션 선택
-        best_action = min(valid, key=lambda a: abs(a // board_size - center) + abs(a % board_size - center))
-        return best_action
+        if self.model is None:
+            valid = np.where(state.flatten() == 0)[0]
+            return int(np.random.choice(valid)) if len(valid) > 0 else 0
+        # lowTrain2와 동일한 관측: (2, 15, 15), 채널0=내 돌(1), 채널1=상대 돌(2)
+        obs = np.zeros((2, 15, 15), dtype=np.float32)
+        obs[0] = (state == 1).astype(np.float32)
+        obs[1] = (state == 2).astype(np.float32)
+        # 빈 칸만 선택 가능 (action_masks)
+        action_masks = (state == 0).reshape(-1)
+        action, _ = self.model.predict(
+            obs,
+            deterministic=True,
+            action_masks=action_masks,
+        )
+        return int(action)
 
 # ==========================================
 # 3. 대결 실행 루프 (Arena)
@@ -170,7 +185,7 @@ class Agent2:
 def main():
     env = OmokEnvGUI(render_mode="human")
     agent1 = HumanAgent(env, name="Human_Black(●)")
-    agent2 = Agent2()
+    agent2 = Agent2(model_path="omok_resnet_ultimate")
     
     state, info = env.reset()
     env.render()
