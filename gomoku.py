@@ -508,7 +508,7 @@ class KhyAgent:
         )
         
         if self.is_training and np.random.rand() < self.epsilon:
-            top_k = min(5, len(valid_moves))
+            top_k = min(7, len(valid_moves))
             sorted_indices = np.argsort(final_score)[-top_k:]
             chosen_idx = np.random.choice(sorted_indices)
             return int(chosen_idx)
@@ -637,8 +637,8 @@ class KhyAgent:
         
         # [업데이트] Loss 스케일 균형을 맞추기 위한 명시적 가중치 설정
         # Policy Loss의 기본 스케일이 훨씬 크므로 가중치를 0.5로 낮추고 Value에 집중
-        weight_value = 1.5
-        weight_policy = 0.3 
+        weight_value = 2.0
+        weight_policy = 0.2 
 
         total_loss = (value_loss * weight_value) + (policy_loss * weight_policy)
 
@@ -758,7 +758,7 @@ def train_main():
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_heu.pth")
+    agent1.load_model("khy_omok_ep1000.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
@@ -778,7 +778,7 @@ def train_main():
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
         # 세대 시작 시 탐험률 초기화
-        agent1.epsilon, agent1.epsilon_decay = 0.15, 0.9855
+        agent1.epsilon, agent1.epsilon_decay = 0.15, 0.992
         
         # 10,000판을 500판 단위로 쪼개어 루프 실행
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
@@ -908,15 +908,15 @@ def train_main():
             
             # --- 500판 종료 직후: 상대방 진화 및 탐험률 롤백 ---
             if phase_end < EPISODES: 
-                if win_rate >= 55.0 and decisive_games >= 100:
+                if win_rate >= 51.0 and decisive_games >= 100:
                     agent1.save_model(f"khy_omok_levelup.pth")
                     agent2_self.model.load_state_dict(agent1.model.state_dict())
                     agent1.memory.clear()
-                    update_msg = "상대방 진화 완료 (승률 55% 돌파)"
+                    update_msg = "상대방 진화 완료 (승률 51% 돌파)"
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
-                agent1.epsilon, agent1.epsilon_decay = 0.15, 0.9855
+                agent1.epsilon, agent1.epsilon_decay = 0.15, 0.992
                 print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
                 
             agent1.save_model(f"khy_omok_ep{phase_end}.pth")
