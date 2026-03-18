@@ -16,6 +16,7 @@ from khy_model import DualHeadResOmokCNN
 from hjw_model import AlphaZeroNet
 from hjw_model import MCTS
 from hjw_model import GomokuGame
+from jmnm_model import board_to_tensor as nami_board_to_tensor, load_nami_model
 
 
 # ==========================================
@@ -553,6 +554,121 @@ class KhyAgent:
             self.epsilon *= self.epsilon_decay
 
 # ==========================================
+# NamiAgent (정민 & 나미팀)
+# ==========================================
+class NamiAgent:
+    """
+    SL(지도학습) + PPO(강화학습) 으로 훈련된 NamiNet 기반 에이전트.
+    - 3채널 입력 (내돌 / 상대돌 / 턴): 흑백 구분 명확
+    - 긴급수 우선 처리 (5목 완성 / 상대 5목 차단)
+    - Policy head argmax 착수
+    """
+    def __init__(self, model_path="nami.pth",
+                 name="NamiAI(🐟)"):
+        self.name = name
+        self.model, self.device = load_nami_model(model_path)
+
+    def _pattern_score(self, board, r, c, player):
+        """
+        r,c에 player 돌을 놓은 뒤 생기는 가장 강한 패턴 점수 반환.
+        10=5목  4=열린4  3=사(닫힌4)  2=33/34  1=열린3
+        """
+        size = board.shape[0]
+        directions = [(0,1),(1,0),(1,1),(-1,1)]
+        open_threes = fours = open_fours = 0
+
+        for dr, dc in directions:
+            consecutive = 1
+            open_ends = 0
+            for step in (1, -1):
+                nr, nc = r + dr*step, c + dc*step
+                while 0 <= nr < size and 0 <= nc < size:
+                    if board[nr, nc] == player:
+                        consecutive += 1
+                    elif board[nr, nc] == 0:
+                        open_ends += 1
+                        break
+                    else:
+                        break
+                    nr += dr*step; nc += dc*step
+
+            if consecutive >= 5:
+                return 10                        # 5목 완성
+            elif consecutive == 4 and open_ends == 2:
+                open_fours += 1                  # 열린 4
+            elif consecutive == 4 and open_ends == 1:
+                fours += 1                       # 닫힌 4 (사)
+            elif consecutive == 3 and open_ends == 2:
+                open_threes += 1                 # 열린 3
+
+        if open_fours >= 1:    return 4          # 열린4 → 다음 수 무조건 이김
+        if fours >= 2:         return 3          # 44
+        if fours >= 1 and open_threes >= 1: return 2   # 34
+        if open_threes >= 2:   return 2          # 33
+        if fours >= 1:         return 1          # 단순 사
+        if open_threes >= 1:   return 0          # 단순 열린3 (긴급 아님)
+        return -1
+
+    def _urgent_move(self, state):
+        """
+        우선순위별 긴급수 반환. 없으면 -1.
+        1순위 내 5목 → 2순위 상대 5목 차단 → 3순위 내 열린4 →
+        4순위 상대 열린4/사 차단 → 5순위 내 33/34 → 6순위 상대 33/34 차단
+        """
+        size = state.shape[0]
+        valid = np.where(state.flatten() == 0)[0]
+
+        best   = [-1, -1, -1, -1, -1, -1]  # 각 우선순위별 후보 (인덱스)
+
+        for move in valid:
+            r, c = move // size, move % size
+
+            # 내 착수 시뮬레이션
+            my_board = state.copy(); my_board[r, c] = 1
+            my_score = self._pattern_score(my_board, r, c, 1)
+
+            # 상대 착수 시뮬레이션
+            op_board = state.copy(); op_board[r, c] = 2
+            op_score = self._pattern_score(op_board, r, c, 2)
+
+            if my_score == 10 and best[0] == -1: best[0] = move  # 내 5목
+            if op_score == 10 and best[1] == -1: best[1] = move  # 상대 5목 차단
+            if my_score == 4  and best[2] == -1: best[2] = move  # 내 열린4
+            if op_score >= 3  and best[3] == -1: best[3] = move  # 상대 열린4/44 차단
+            if my_score == 2  and best[4] == -1: best[4] = move  # 내 33/34
+            if op_score == 2  and best[5] == -1: best[5] = move  # 상대 33/34 차단
+
+        for candidate in best:
+            if candidate != -1:
+                return candidate
+        return -1
+
+    def select_action(self, state):
+        """
+        state: (15,15) numpy, 0=빈칸 1=내돌 2=상대돌
+        반환: 착수 위치 (int, 0~224)
+        """
+        # 1. 긴급수 (5목 완성 / 차단)
+        urgent = self._urgent_move(state)
+        if urgent != -1:
+            return urgent
+
+        # 2. 모델 추론
+        state_t = nami_board_to_tensor(state)          # (3,15,15)
+        t = torch.tensor(state_t).unsqueeze(0).to(self.device)  # (1,3,15,15)
+        with torch.no_grad():
+            pol_logits, _ = self.model(t)
+        pol_logits = pol_logits.squeeze(0)             # (225,)
+
+        # 빈 칸만 착수 가능
+        valid_mask = torch.tensor(
+            (state.flatten() == 0), dtype=torch.bool, device=self.device)
+        pol_logits[~valid_mask] = -1e9
+
+        return int(torch.argmax(pol_logits).item())
+
+
+# ==========================================
 # 홍정우AlphaZeroAgent
 # ==========================================
 BOARD_SIZE = 15
@@ -606,17 +722,28 @@ def main():
     # agent1.load_model("khy_omok_gen2_final.pth")
     agent2.eval_mode()
 
+    # ================================================================
+    # NamiAI와 대결하고 싶으면:
+    #   1. nami.pth 가중치 파일을 이 폴더에 받아주세요
+    #   2. 아래 주석(agent1 = NamiAgent(...))을 풀고
+    #      그 아래 agent1 = AlphaZeroAgent(...) 줄을 주석 처리하세요
+    #   3. while 루프 안의 주석도 풀고 아래 줄을 주석 처리하세요
+    #      # action = agent1.select_action(state)  ← 이 줄 주석 해제
+    #      action = agent1.select_action(state, player_id=1)  ← 이 줄 주석 처리
+    # ================================================================
+    # agent1 = NamiAgent(name="NamiAI(🐟)")
     agent1 = AlphaZeroAgent(name="AlphaZero(🤖)")
-    
+
     state, info = env.reset()
     env.render()
     terminated = False
-    
+
     print(f"=== ⚔️ {agent1.name} vs {agent2.name} 대결 시작 ===")
-    
+
     while not terminated:
         # 턴에 따른 상태 반전 논리 (상대는 항상 자신이 흑돌인 것처럼 착각하게 만듦)
         if info["current_player"] == 1:
+            # NamiAgent 사용 시 아래 주석을 풀고 그 아래 줄을 주석 처리하세요
             # action = agent1.select_action(state)
             action = agent1.select_action(state, player_id=1)
         else:
