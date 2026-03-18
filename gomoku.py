@@ -154,7 +154,7 @@ class HumanAgent:
                 self.clicked_action = action
 
 class HeuristicAgent:
-    def __init__(self, name="Heuristic_AI", mistake_prob=0.3):
+    def __init__(self, name="Heuristic_AI", mistake_prob=0.0):
         self.name = name
         self.mistake_prob = mistake_prob
 
@@ -369,22 +369,44 @@ class KhyAgent:
         self.name = "Khy_AI"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005, weight_decay=1e-4)
 
         self.is_training = True
         
         # 탐험 파라미터
         self.epsilon = 1.0
-        self.epsilon_min = 0.01
+        self.epsilon_min = 0.00
         self.epsilon_decay = 0.999
         
         # 경험 재생 메모리
-        self.memory = deque(maxlen=150000)
+        self.memory = deque(maxlen=50000)
         self.batch_size = 1024
         self.gamma = 0.99
-
+    
     # ====================
     # 행동 선택 로직
+    def _normalize_to_range(self, values, valid_moves, target_min=-1.0, target_max=1.0):
+        board_size = int(np.sqrt(len(values)))
+        result = np.full(len(values), -float('inf'), dtype=np.float32)
+        
+        valid_values = values[valid_moves]
+        if len(valid_values) == 0:
+            return result
+            
+        v_min = np.min(valid_values)
+        v_max = np.max(valid_values)
+        
+        if v_max > v_min:
+            # 1. 0 ~ 1 사이로 Min-Max 스케일링
+            scaled = (valid_values - v_min) / (v_max - v_min)
+            # 2. 목표 범위(target_min ~ target_max)로 변환
+            result[valid_moves] = (scaled * (target_max - target_min)) + target_min
+        else:
+            # 모든 값의 차이가 없다면 특혜나 페널티 없이 중립(0.0) 부여
+            result[valid_moves] = 0.0 
+            
+        return result
+    
     def select_action(self, state, move_count=0):
         board_size = state.shape[0]
         total_grids = board_size * board_size 
@@ -424,22 +446,7 @@ class KhyAgent:
         policy_logits[valid_mask] = -float('inf')
         policy_probs = F.softmax(policy_logits, dim=0).cpu().numpy()
 
-        # 탐험을 위한 디리클레 노이즈 주입 (Train 모드일 때만)
-        if self.is_training:
-            noise = np.random.dirichlet([0.3] * len(valid_moves))
-            policy_probs[valid_moves] = 0.75 * policy_probs[valid_moves] + 0.25 * noise
-            policy_probs /= np.sum(policy_probs[valid_moves])
-
-        # MinMax 정규화
-        p_min = policy_probs[valid_moves].min()
-        p_max = policy_probs[valid_moves].max()
-
-        if p_max > p_min:
-            policy_scaled = (policy_probs - p_min) / (p_max - p_min)
-        else:
-            policy_scaled = policy_probs
-
-        # Rollout Q-Value
+        # Rollout 결과
         num_simulations = 400
         action_visits = np.zeros(total_grids)
         action_wins = np.zeros(total_grids)
@@ -449,13 +456,11 @@ class KhyAgent:
             probs /= np.sum(probs)
             sim_action = np.random.choice(valid_moves, p=probs)
             
-            # Numba로 최적화된 20수 무작위 롤아웃 실행 (빠른 속도)
             reward = fast_rollout_fast(state, sim_action, max_depth=30)
             action_visits[sim_action] += 1
             action_wins[sim_action] += reward
         
-        # 롤아웃 결과 평균 승률 산출
-        sim_q_values = np.divide(action_wins, action_visits, out=np.zeros_like(action_wins), where=action_visits!=0)
+        raw_rollout_values = np.divide(action_wins, action_visits, out=np.zeros_like(action_wins), where=action_visits!=0)
 
         # 가치 일괄 평가
         num_valid = len(valid_moves)
@@ -465,7 +470,6 @@ class KhyAgent:
             r, c = move // board_size, move % board_size
             next_state = state.copy()
             next_state[r, c] = 1 
-            # 다음 턴(상대) 시점으로 보드판 정규화 (시점 반전)
             canonical_next_state = np.where(next_state != 0, 3 - next_state, 0)
             next_states_batch[i, 0] = canonical_next_state
             
@@ -474,28 +478,42 @@ class KhyAgent:
             _, next_values = self.model(batch_tensor)
             next_values = next_values.flatten().cpu().numpy()
             
-        cnn_values_full = np.zeros(total_grids)
-        # 내 입장에서의 승률로 부호 반전(-)
-        cnn_values_full[valid_moves] = -1.0 * next_values
+        raw_cnn_values = np.zeros(total_grids)
+        raw_cnn_values[valid_moves] = -1.0 * next_values # 내 입장에서 부호 반전
 
-        # 내재적 보상
-        intrinsic_rewards = np.zeros(total_grids)
+        # 내재적 보상(Intrinsic)
+        raw_intrinsic_rewards = np.zeros(total_grids)
         for move in valid_moves:
-            intrinsic_rewards[move] = self.get_intrinsic_reward(state, move)
+            raw_intrinsic_rewards[move] = self.get_intrinsic_reward(state, move)
 
-        w_policy  = 0.2  # 직관의 비중
-        w_rollout = 0.3  # 난전/전술 검증의 비중
-        w_value   = 0.3  # 대국적인 형세 판단의 비중
-        w_int     = 0.2  # 당장의 포메이션(안전) 비중
+        # 정규화
+        norm_policy   = self._normalize_to_range(policy_probs, valid_moves)
+        norm_rollout  = self._normalize_to_range(raw_rollout_values, valid_moves)
+        norm_value    = self._normalize_to_range(raw_cnn_values, valid_moves)
+        norm_int      = self._normalize_to_range(raw_intrinsic_rewards, valid_moves)
+        
+        w_policy  = 0.25
+        w_rollout = 0.20
+        w_value   = 0.25
+        w_int     = 0.30
 
-        # 방문하지 않은 곳도 Value와 Intrinsic, Policy는 평가가 가능하므로 합산
+        # 최종 스코어 계산 (모든 값이 -1 ~ 1 스케일을 가짐)
         final_score = np.where(
             np.isin(np.arange(total_grids), valid_moves), 
-            (w_policy * policy_scaled) + (w_rollout * sim_q_values) + (w_value * cnn_values_full) + (w_int * intrinsic_rewards), 
+            (w_policy * norm_policy) + 
+            (w_rollout * norm_rollout) + 
+            (w_value * norm_value) + 
+            (w_int * norm_int), 
             -float('inf')
         )
-
-        return np.argmax(final_score)
+        
+        if self.is_training and np.random.rand() < self.epsilon:
+            top_k = min(5, len(valid_moves))
+            sorted_indices = np.argsort(final_score)[-top_k:]
+            chosen_idx = np.random.choice(sorted_indices)
+            return int(chosen_idx)
+        else:
+            return int(np.argmax(final_score))
     
     # ====================
     # 내재적 보상
@@ -586,10 +604,15 @@ class KhyAgent:
                 self.memory.append((flip_s.copy(), flip_a, total_reward))
                 
             # 다음(이전 턴) 계산을 위해 보상 업데이트
-            if final_reward > 0: # 이긴 게임: 이전 턴으로 갈수록 가치 감소
+            if final_reward > 0:
+                # 승리: 늦게 이길수록 가치 하락 (스텝 비용 차감)
                 discounted_reward = discounted_reward * self.gamma - step_cost
-            else: # 진 게임: 이전 턴으로 갈수록 가치 하락 (더 나쁘게 평가)
-                discounted_reward = discounted_reward * self.gamma - step_cost
+            elif final_reward < 0:
+                # 패배: 늦게 질수록 덜 나쁨 (즉, 이전 턴일수록 책임이 적음 -> 0에 가깝게 수렴)
+                discounted_reward = discounted_reward * self.gamma + step_cost 
+            else:
+                # 무승부
+                discounted_reward = discounted_reward * self.gamma
             
             # 하한선 방어
             discounted_reward = max(discounted_reward, -1.0)
@@ -612,8 +635,12 @@ class KhyAgent:
         value_loss = F.mse_loss(values, targets_tensor)
         policy_loss = F.cross_entropy(policy_logits, actions_tensor)
         
-        # [핵심] 두 Loss를 합치되, 스케일에 따라 가중치(예: c=1.0)를 둘 수 있습니다.
-        total_loss = (value_loss * 1.5) + policy_loss
+        # [업데이트] Loss 스케일 균형을 맞추기 위한 명시적 가중치 설정
+        # Policy Loss의 기본 스케일이 훨씬 크므로 가중치를 0.5로 낮추고 Value에 집중
+        weight_value = 1.5
+        weight_policy = 0.3 
+
+        total_loss = (value_loss * weight_value) + (policy_loss * weight_policy)
 
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -653,7 +680,7 @@ def main():
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
-    agent1.load_model("khy_omok_gen2_final.pth")
+    agent1.load_model("khy_omok_heu.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -725,21 +752,21 @@ def train_main():
     env = OmokEnvGUI(render_mode=None)
     
     # [추가] 텐서보드 Writer 초기화 (실행할 때마다 runs 폴더 내에 기록됨)
-    writer = SummaryWriter("runs/omok_training_v1")
+    # writer = SummaryWriter("runs/omok_training_v1")
     plotter = LivePlotter(title="Real-time Training Status")
     
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_gen2_final.pth")
+    agent1.load_model("khy_omok_heu.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
     # 셀프 대결을 위한 상대방 에이전트 (과거의 나)
     model2 = DualHeadResOmokCNN()
-    agent2_self = HeuristicAgent()
-    # agent2_self.model.load_state_dict(agent1.model.state_dict())
-    # agent2_self.eval_mode()
+    agent2_self = KhyAgent(model2)
+    agent2_self.model.load_state_dict(agent1.model.state_dict())
+    agent2_self.eval_mode()
     
     N = 10
     EPISODES = 10000
@@ -751,7 +778,7 @@ def train_main():
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
         # 세대 시작 시 탐험률 초기화
-        agent1.epsilon, agent1.epsilon_decay = 0.0, 1.0
+        agent1.epsilon, agent1.epsilon_decay = 0.15, 0.9855
         
         # 10,000판을 500판 단위로 쪼개어 루프 실행
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
@@ -882,22 +909,20 @@ def train_main():
             # --- 500판 종료 직후: 상대방 진화 및 탐험률 롤백 ---
             if phase_end < EPISODES: 
                 if win_rate >= 55.0 and decisive_games >= 100:
-                    agent1.save_model(f"khy_omok_ep{phase_end}.pth")
+                    agent1.save_model(f"khy_omok_levelup.pth")
                     agent2_self.model.load_state_dict(agent1.model.state_dict())
                     agent1.memory.clear()
                     update_msg = "상대방 진화 완료 (승률 55% 돌파)"
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
-                agent1.epsilon = 0.0
-                agent1.epsilon_decay = 1.0
+                agent1.epsilon, agent1.epsilon_decay = 0.15, 0.9855
                 print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
-
-        # 1세대 종료 후 최종 모델 저장
-        agent1.save_model(f"khy_omok_gen{gen}_final.pth")
+                
+            agent1.save_model(f"khy_omok_ep{phase_end}.pth")
         
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
-    writer.close() # [추가] 모든 학습 완료 시 텐서보드 Writer 닫기
+    # writer.close() # [추가] 모든 학습 완료 시 텐서보드 Writer 닫기
     env.close()
     
     plt.ioff()
