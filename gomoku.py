@@ -334,11 +334,11 @@ def fast_rollout_fast(state, action, max_depth, max_moves=100):
     for depth in range(max_depth):
         # 100수 도달 시 (사용자 요청: -0.4)
         if current_stones >= max_moves:
-            return -0.4
+            return -0.8
             
         # 판이 꽉 찼을 때 (자연 무승부)
         if num_valid == 0:
-            return -0.2 
+            return -0.8
         
         idx = np.random.randint(num_valid)
         sim_action = valid_moves[idx]
@@ -362,24 +362,25 @@ def fast_rollout_fast(state, action, max_depth, max_moves=100):
         current_player = 3 - current_player
         
     # 메모리의 무승부 기준(-0.2)을 반환하여 중립적인 가치를 부여
-    return -0.2
+    return -0.8
     
 class KhyAgent:
     def __init__(self, model):
         self.name = "Khy_AI"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005, weight_decay=1e-4)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0002, weight_decay=1e-4)
 
         self.is_training = True
         
         # 탐험 파라미터
         self.epsilon = 1.0
-        self.epsilon_min = 0.00
+        self.epsilon_min = 0.01
         self.epsilon_decay = 0.999
         
         # 경험 재생 메모리
-        self.memory = deque(maxlen=50000)
+        self.win_memory = deque(maxlen=12000)
+        self.loss_memory = deque(maxlen=12000)
         self.batch_size = 1024
         self.gamma = 0.99
     
@@ -416,8 +417,25 @@ class KhyAgent:
             return 0
         
         occupied = np.argwhere(state != 0)
+        # 보드가 비어있을 때 (흑 1수) -> 중앙 착수
         if len(occupied) == 0:
-            return (board_size // 2) * board_size + (board_size // 2)
+            center = board_size // 2
+            return center * board_size + center
+        
+        # 내가 백돌로 첫 수
+        if len(occupied) == 1:
+            r, c = occupied[0]
+            center = board_size // 2
+            
+            if r != center or c != center:
+                return center * board_size + center
+
+            directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+            np.random.shuffle(directions) 
+            for dr, dc in directions:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < board_size and 0 <= nc < board_size and state[nr, nc] == 0:
+                    return nr * board_size + nc
         
         # 인접 빈칸 탐색, 위급 수 방어
         sensible_moves = set()
@@ -447,7 +465,7 @@ class KhyAgent:
         policy_probs = F.softmax(policy_logits, dim=0).cpu().numpy()
 
         # Rollout 결과
-        num_simulations = 400
+        num_simulations = 1000
         action_visits = np.zeros(total_grids)
         action_wins = np.zeros(total_grids)
 
@@ -492,8 +510,8 @@ class KhyAgent:
         norm_value    = self._normalize_to_range(raw_cnn_values, valid_moves)
         norm_int      = self._normalize_to_range(raw_intrinsic_rewards, valid_moves)
         
-        w_policy  = 0.25
-        w_rollout = 0.20
+        w_policy  = 0.15
+        w_rollout = 0.30
         w_value   = 0.25
         w_int     = 0.30
 
@@ -558,7 +576,7 @@ class KhyAgent:
             
             # 양수겸장 판단 (최대 1.0을 넘지 않도록 조정)
             if pattern_counts['four'] >= 2 or (pattern_counts['four'] >= 1 and pattern_counts['open_3'] >= 1) or pattern_counts['open_3'] >= 2:
-                score = max(score, 0.25)
+                score = max(score, 0.3)
                 
             return score
 
@@ -593,15 +611,17 @@ class KhyAgent:
             action_matrix[action // board_size, action % board_size] = 1
             
             for i in range(4):
-                # 회전
                 rot_s = np.rot90(state, k=i)
                 rot_a = np.argmax(np.rot90(action_matrix, k=i))
-                self.memory.append((rot_s.copy(), rot_a, total_reward))
-                
-                # 좌우 반전 후 회전
                 flip_s = np.fliplr(rot_s)
                 flip_a = np.argmax(np.fliplr(np.rot90(action_matrix, k=i)))
-                self.memory.append((flip_s.copy(), flip_a, total_reward))
+            
+                if final_reward > 0:
+                        self.win_memory.append((rot_s.copy(), rot_a, total_reward))
+                        self.win_memory.append((flip_s.copy(), flip_a, total_reward))
+                else:
+                    self.loss_memory.append((rot_s.copy(), rot_a, total_reward))
+                    self.loss_memory.append((flip_s.copy(), flip_a, total_reward))
                 
             # 다음(이전 턴) 계산을 위해 보상 업데이트
             if final_reward > 0:
@@ -620,10 +640,21 @@ class KhyAgent:
     # ====================
     # 복습 엔진
     def replay_experience(self):
-        if len(self.memory) < self.batch_size:
+        if len(self.win_memory) + len(self.loss_memory) < self.batch_size:
+            return 0.0, 0.0
             return 0.0, 0.0 # 학습을 안 했을 때는 0 반환
         
-        minibatch = random.sample(self.memory, self.batch_size)
+        win_sample_size = min(len(self.win_memory), self.batch_size // 2)
+        loss_sample_size = self.batch_size - win_sample_size # 모자란 만큼 패배 데이터로 채움
+
+        minibatch = []
+        if win_sample_size > 0:
+            minibatch.extend(random.sample(self.win_memory, win_sample_size))
+        if loss_sample_size > 0:
+            minibatch.extend(random.sample(self.loss_memory, loss_sample_size))
+            
+        random.shuffle(minibatch)
+
         states, actions, targets = zip(*minibatch)
 
         states_tensor = torch.FloatTensor(np.array(states)).unsqueeze(1).to(self.device)
@@ -635,8 +666,6 @@ class KhyAgent:
         value_loss = F.mse_loss(values, targets_tensor)
         policy_loss = F.cross_entropy(policy_logits, actions_tensor)
         
-        # [업데이트] Loss 스케일 균형을 맞추기 위한 명시적 가중치 설정
-        # Policy Loss의 기본 스케일이 훨씬 크므로 가중치를 0.5로 낮추고 Value에 집중
         weight_value = 2.0
         weight_policy = 0.2 
 
@@ -750,23 +779,21 @@ class LivePlotter:
 
 def train_main():
     env = OmokEnvGUI(render_mode=None)
-    
-    # [추가] 텐서보드 Writer 초기화 (실행할 때마다 runs 폴더 내에 기록됨)
-    # writer = SummaryWriter("runs/omok_training_v1")
     plotter = LivePlotter(title="Real-time Training Status")
     
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_levelup.pth")
+    # agent1.load_model("khy_omok_ep2000.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
     # 셀프 대결을 위한 상대방 에이전트 (과거의 나)
-    model2 = DualHeadResOmokCNN()
-    agent2_self = KhyAgent(model2)
-    agent2_self.model.load_state_dict(agent1.model.state_dict())
-    agent2_self.eval_mode()
+    # model2 = DualHeadResOmokCNN()
+    # agent2_self = KhyAgent(model2)
+    # agent2_self.model.load_state_dict(agent1.model.state_dict())
+    # agent2_self.eval_mode()
+    agent2_self = HeuristicAgent()
     
     N = 10
     EPISODES = 10000
@@ -778,7 +805,7 @@ def train_main():
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
         # 세대 시작 시 탐험률 초기화
-        agent1.epsilon, agent1.epsilon_decay = 0.15, 0.992
+        agent1.epsilon, agent1.epsilon_decay = 0.05, 0.992
         
         # 10,000판을 500판 단위로 쪼개어 루프 실행
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
@@ -834,7 +861,7 @@ def train_main():
                     next_state, reward, terminated, _, info = env.step(action)
                     state = next_state
                     current_episode_steps += 1
-
+                    
                 total_steps += current_episode_steps
 
                 # --- 게임 종료 후: 승패 기록 및 복습 ---
@@ -844,7 +871,7 @@ def train_main():
                     final_reward = 1.0  
                 elif winner == 0: 
                     draws += 1
-                    final_reward = -0.2
+                    final_reward = -0.8
                 else: 
                     agent1_losses += 1
                     final_reward = -1.0 
@@ -870,8 +897,6 @@ def train_main():
                 if valid_trains > 0:
                     ep_v_loss /= valid_trains
                     ep_p_loss /= valid_trains
-                    # writer.add_scalar("1_Loss/Value_Loss", ep_v_loss, global_episode)
-                    # writer.add_scalar("1_Loss/Policy_Loss", ep_p_loss, global_episode)
                     
                     if global_episode % 10 == 0:
                         plotter.update(ep_v_loss, ep_p_loss)
@@ -887,18 +912,13 @@ def train_main():
                     
                 avg_steps = total_steps // current_phase_ep
                 
-                # [추가] 텐서보드에 훈련 지표 기록
-                # writer.add_scalar("2_Metrics/Win_Rate", win_rate, global_episode)
-                # writer.add_scalar("2_Metrics/Steps_per_Game", current_episode_steps, global_episode)
-                # writer.add_scalar("3_Hyperparameters/Epsilon", agent1.epsilon, global_episode)
-
                 pbar.set_postfix({
                     "승/무/패": f"{agent1_wins}/{draws}/{agent1_losses}",
                     "유효승률": f"{win_rate:.1f}%",
                     "현재": f"{current_episode_steps}수",
                     "평균": f"{avg_steps}수",
                     "입실론": f"{agent1.epsilon:.3f}",
-                    "메모리": f"{len(agent1.memory)}"
+                    "메모리": f"W:{len(agent1.win_memory)}/L:{len(agent1.loss_memory)}" # ◀ 변경됨
                 })
                 pbar.update(1)
                 
@@ -908,21 +928,24 @@ def train_main():
             
             # --- 500판 종료 직후: 상대방 진화 및 탐험률 롤백 ---
             if phase_end < EPISODES: 
-                if win_rate >= 51.0 and decisive_games >= 100:
-                    agent1.save_model(f"khy_omok_levelup.pth")
+                if win_rate >= 60.0 and decisive_games >= 100:
+                    agent1.save_model(f"khy_omok_hue.pth")
                     agent2_self.model.load_state_dict(agent1.model.state_dict())
-                    agent1.memory.clear()
-                    update_msg = "상대방 진화 완료 (승률 51% 돌파)"
+                    
+                    # [수정] 승리/패배 메모리를 각각 비워줌
+                    agent1.win_memory.clear()  # ◀ 변경됨
+                    agent1.loss_memory.clear() # ◀ 변경됨
+                    
+                    update_msg = "상대방 진화 완료 (승률 60% 돌파)"
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
-                agent1.epsilon, agent1.epsilon_decay = 0.15, 0.992
+                agent1.epsilon, agent1.epsilon_decay = 0.05, 0.992
                 print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
                 
             agent1.save_model(f"khy_omok_ep{phase_end}.pth")
         
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
-    # writer.close() # [추가] 모든 학습 완료 시 텐서보드 Writer 닫기
     env.close()
     
     plt.ioff()
