@@ -369,7 +369,7 @@ class KhyAgent:
         self.name = "Khy_AI"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001, weight_decay=1e-4)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.00005, weight_decay=1e-4)
 
         self.is_training = True
         
@@ -640,14 +640,26 @@ class KhyAgent:
     # ====================
     # 복습 엔진
     def replay_experience(self):
+        # 1. 전체 메모리 합이 배치 사이즈보다 작으면 학습을 시작하지 않음
         if len(self.win_memory) + len(self.loss_memory) < self.batch_size:
             return 0.0, 0.0
-            return 0.0, 0.0 # 학습을 안 했을 때는 0 반환
+
+        # 2. 목표로 하는 샘플링 비율 (예: 5:5)
+        target_win_size = self.batch_size // 2
         
-        win_sample_size = min(len(self.win_memory), self.batch_size // 2)
-        loss_sample_size = self.batch_size - win_sample_size # 모자란 만큼 패배 데이터로 채움
+        # 3. [승리 메모리 안전장치] 실제 가진 개수와 목표 중 작은 값을 선택
+        win_sample_size = min(len(self.win_memory), target_win_size)
+        
+        # 4. [패배 메모리 안전장치] 남은 자리를 패배 데이터로 채우되, 실제 개수를 넘지 않게 함
+        target_loss_size = self.batch_size - win_sample_size
+        loss_sample_size = min(len(self.loss_memory), target_loss_size)
+        
+        # 5. 혹시나 부족한 자리가 있다면 승리 메모리에서 더 가져옴 (보완책)
+        if win_sample_size + loss_sample_size < self.batch_size:
+            win_sample_size = min(len(self.win_memory), self.batch_size - loss_sample_size)
 
         minibatch = []
+
         if win_sample_size > 0:
             minibatch.extend(random.sample(self.win_memory, win_sample_size))
         if loss_sample_size > 0:
@@ -805,7 +817,7 @@ def train_main():
         print(f"\n{'='*40}\n[Generation {gen}/{N}] 제 {gen}세대\n{'='*40}")
         
         # 세대 시작 시 탐험률 초기화
-        agent1.epsilon, agent1.epsilon_decay = 0.05, 0.992
+        agent1.epsilon, agent1.epsilon_decay = 0.00, 0.992
         
         # 10,000판을 500판 단위로 쪼개어 루프 실행
         for phase_start in range(1, EPISODES + 1, UPDATE_INTERVAL):
@@ -940,7 +952,7 @@ def train_main():
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
-                agent1.epsilon, agent1.epsilon_decay = 0.05, 0.992
+                agent1.epsilon, agent1.epsilon_decay = 0.00, 0.992
                 print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
                 
             agent1.save_model(f"episode/khy_omok_{gen}_ep{phase_end}.pth")
