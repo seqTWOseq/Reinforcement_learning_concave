@@ -306,61 +306,41 @@ def find_urgent_move_fast(state, valid_moves, num_valid, player):
     return best_move
 
 @njit
-def fast_rollout_fast(state, action, max_depth, max_moves=100):
-    """극단적으로 최적화된 초고속 MCTS 시뮬레이션 엔진"""
+def fast_rollout_fast(state, action, max_depth, max_moves=225):
+    """극단적으로 최적화된 초고속 MCTS 시뮬레이션 엔진 (순수 랜덤 탐색으로 회귀)"""
     board_size = state.shape[0]
     sim_state = state.copy()
     r = action // board_size
     c = action % board_size
     sim_state[r, c] = 1 
     
-    current_stones = 0
-    for i in range(board_size):
-        for j in range(board_size):
-            if sim_state[i, j] != 0:
-                current_stones += 1
-                
-    # 내가 방금 둔 수로 즉시 승리
+    # 내가 방금 둔 수로 즉시 승리하는지만 확인
     if check_pattern_fast(sim_state, r, c, 1, 5, 0):
         return 1.0 
         
     current_player = 2
     depth_penalty_weight = 0.01
 
-    valid_moves = np.where(sim_state.flatten() == 0)[0]
+    # Numba 속도를 극대화하기 위한 1차원 배열 연산
+    flat_state = sim_state.flatten()
+    valid_moves = np.where(flat_state == 0)[0]
     num_valid = len(valid_moves)
 
     for depth in range(max_depth):
-        if current_stones >= max_moves:
-            return -0.8
-            
         if num_valid == 0:
             return -0.8
-        
-        # 랜덤 착수 전, 위급한 수(승리/패배 직결)가 있는지 먼저 확인
-        urgent_move = find_urgent_move_fast(sim_state, valid_moves, num_valid, current_player)
-        
-        if urgent_move != -1:
-            # 위급한 수가 있다면 무조건 그곳에 착수 (시뮬레이션의 현실성 극대화)
-            sim_action = urgent_move
             
-            # valid_moves 배열에서 선택된 수 제거 (Numba 최적화 방식)
-            for i in range(num_valid):
-                if valid_moves[i] == sim_action:
-                    valid_moves[i] = valid_moves[num_valid - 1]
-                    break
-        else:
-            # 위급한 수가 없다면 기존처럼 랜덤 착수 (탐험 유지)
-            idx = np.random.randint(num_valid)
-            sim_action = valid_moves[idx]
-            valid_moves[idx] = valid_moves[num_valid - 1]
-            
+        # [핵심 수정] 위급수 탐색(수백만 번 연산) 제거 -> 순수 랜덤 롤아웃
+        idx = np.random.randint(num_valid)
+        sim_action = valid_moves[idx]
+        
+        # 선택한 수는 배열 맨 끝 값으로 덮어씌워서 O(1) 속도로 제거
+        valid_moves[idx] = valid_moves[num_valid - 1]
         num_valid -= 1
             
         sr = sim_action // board_size
         sc = sim_action % board_size
         sim_state[sr, sc] = current_player
-        current_stones += 1 
         
         # 승패 판정
         if check_pattern_fast(sim_state, sr, sc, current_player, 5, 0):
@@ -733,12 +713,12 @@ class KhyAgent:
 # ==========================================
 def main():
     env = OmokEnvGUI(render_mode="human")
-    agent2 = HumanAgent(env)
+    agent2 = HeuristicAgent()
     
     
     model = DualHeadResOmokCNN()
     agent1 = KhyAgent(model)
-    agent1.load_model("khy_omok_levelup.pth")
+    agent1.load_model("khy_omok_levelup4.pth")
     agent1.eval_mode()
     
     state, info = env.reset()
@@ -813,7 +793,7 @@ def train_main():
     # 학습할 메인 에이전트
     model1 = DualHeadResOmokCNN()  
     agent1 = KhyAgent(model1)
-    agent1.load_model("khy_omok_first_heu.pth")
+    agent1.load_model("khy_omok_levelup2.pth")
     print(f"[Device 확인] {agent1.device}")
     agent1.train_mode()
     
@@ -823,6 +803,8 @@ def train_main():
     agent2_self.model.load_state_dict(agent1.model.state_dict())
     agent2_self.eval_mode()
     # agent2_self = HeuristicAgent()
+    
+    heuristic_agent = HeuristicAgent()
     
     N = 10
     EPISODES = 10000
@@ -842,6 +824,8 @@ def train_main():
             
             # 통계 초기화
             agent1_wins, draws, agent1_losses, total_steps = 0, 0, 0, 0
+            
+            heuristic_matches = 0
             pbar = tqdm(total=UPDATE_INTERVAL, desc=f"[Gen {gen}] {phase_start}~{phase_end}판", position=0, leave=True)
             
             for episode in range(phase_start, phase_end + 1):
@@ -853,12 +837,17 @@ def train_main():
                 current_episode_steps = 0 
                 
                 agent1_color = 1 if np.random.rand() < 0.5 else 2
+                
+                if np.random.rand() < 0.2:
+                    current_opponent = heuristic_agent
+                    heuristic_matches += 1
+                else:
+                    current_opponent = agent2_self
 
                 # --- 단일 에피소드(게임) 진행 ---
                 while not terminated:
                     current_player = info["current_player"]
                     
-                    # 100수 제한 강제 패배 로직
                     if current_episode_steps >= 100:
                         terminated = True
                         info["winner"] = 0 
@@ -870,16 +859,19 @@ def train_main():
                         canonical_state = state.copy()
                         
                     is_opening = current_episode_steps < 2
-
                     is_agent1_turn = (current_player == agent1_color)
-                    active_agent = agent1 if is_agent1_turn else agent2_self
+                    
+                    # [수정] 내 턴이면 나(agent1), 아니면 위에서 결정된 상대방이 둡니다.
+                    active_agent = agent1 if is_agent1_turn else current_opponent
                     
                     if is_opening:
                         valid_moves = np.where(canonical_state.flatten() == 0)[0]
                         action = np.random.choice(valid_moves)
                     else:
+                        # HeuristicAgent와 KhyAgent 모두 move_count를 받도록 처리
                         action = active_agent.select_action(canonical_state, move_count=current_episode_steps)
                         
+                    # (이후 보상 기록, 환경 step, 복습 로직은 기존과 동일하게 유지)
                     step_reward = agent1.get_intrinsic_reward(canonical_state, action)
                     
                     if current_player == 1:
@@ -910,35 +902,26 @@ def train_main():
                 else:
                     agent1.memorize_episode(memory_w, final_reward)
                     
-                # [수정] 복습 시 반환된 Loss를 합산하여 에피소드 평균 Loss 계산
                 ep_v_loss, ep_p_loss = 0.0, 0.0
                 valid_trains = 0
                 
                 for _ in range(8):
                     v_loss, p_loss = agent1.replay_experience()
-                    # 학습이 이루어졌을 때만 누적 (초반 메모리 부족 시 0 반환됨)
                     if v_loss > 0 or p_loss > 0: 
                         ep_v_loss += v_loss
                         ep_p_loss += p_loss
                         valid_trains += 1
                 
-                # [추가] 텐서보드에 네트워크 Loss 기록 (학습이 1번이라도 진행된 경우)
                 if valid_trains > 0:
                     ep_v_loss /= valid_trains
                     ep_p_loss /= valid_trains
-                    
                     if global_episode % 10 == 0:
                         plotter.update(ep_v_loss, ep_p_loss)
 
                 # --- 통계 계산 ---
                 current_phase_ep = episode - phase_start + 1
                 decisive_games = agent1_wins + agent1_losses 
-                
-                if decisive_games > 0:
-                    win_rate = (agent1_wins / decisive_games) * 100 
-                else:
-                    win_rate = 0.0
-                    
+                win_rate = (agent1_wins / decisive_games) * 100 if decisive_games > 0 else 0.0
                 avg_steps = total_steps // current_phase_ep
                 
                 pbar.set_postfix({
@@ -946,7 +929,7 @@ def train_main():
                     "유효승률": f"{win_rate:.1f}%",
                     "현재": f"{current_episode_steps}수",
                     "평균": f"{avg_steps}수",
-                    "입실론": f"{agent1.epsilon:.3f}",
+                    "휴리스틱비율": f"{(heuristic_matches/current_phase_ep)*100:.0f}%",
                     "메모리": f"W:{len(agent1.win_memory)}/L:{len(agent1.loss_memory)}" # ◀ 변경됨
                 })
                 pbar.update(1)
@@ -957,28 +940,117 @@ def train_main():
             
             # --- 500판 종료 직후: 상대방 진화 및 탐험률 롤백 ---
             if phase_end < EPISODES: 
-                if win_rate >= 60.0 and decisive_games >= 100:
-                    agent1.save_model(f"khy_omok_levelup{gen}_{EPISODES}.pth")
+                if win_rate >= 55.0 and decisive_games >= 100:
+                    agent1.save_model(f"khy_omok_levelup{gen}_{phase_end}.pth")
                     agent2_self.model.load_state_dict(agent1.model.state_dict())
-                    
-                    # [수정] 승리/패배 메모리를 각각 비워줌
-                    agent1.win_memory.clear()  # ◀ 변경됨
-                    agent1.loss_memory.clear() # ◀ 변경됨
-                    
-                    update_msg = "상대방 진화 완료 (승률 60% 돌파)"
+                    agent1.win_memory.clear()  
+                    agent1.loss_memory.clear() 
+                    update_msg = "상대방 진화 완료 (승률 55% 돌파)"
                 else:
                     update_msg = "상대방 유지 (승률 부족으로 진화 보류)"
                     
                 agent1.epsilon, agent1.epsilon_decay = 0.00, 0.992
-                print(f"[업데이트] {phase_end}판 종료: {update_msg} / [입실론 롤백: {agent1.epsilon:.3f}]\n")
+                print(f"[업데이트] {phase_end}판 종료: {update_msg}\n")
                 
             agent1.save_model(f"episode/khy_omok_{gen}_ep{phase_end}.pth")
-        
+            
     print(f"\n=== 총 {N}세대({N * EPISODES}판)의 대장정 완료 ===")
     env.close()
-    
     plt.ioff()
     plt.show()
+    
+# ==========================================================================
+def evaluate_vs_heuristic(model_path, num_games=100):
+    print(f"\n{'='*50}")
+    print(f"🤖 진단 테스트 시작: KhyAgent vs HeuristicAgent ({num_games}판)")
+    print(f"불러올 가중치: {model_path}")
+    print(f"{'='*50}\n")
+
+    # 1. 환경 및 에이전트 초기화
+    env = OmokEnvGUI(render_mode=None)
+    
+    # 평가받을 모델 (KhyAgent)
+    model = DualHeadResOmokCNN()
+    agent = KhyAgent(model)
+    agent.load_model(model_path)
+    agent.eval_mode() # 탐험(입실론) 0, 평가 모드
+    
+    # 상대방 (휴리스틱)
+    heuristic = HeuristicAgent()
+
+    # 통계 변수
+    agent_wins = 0
+    draws = 0
+    agent_losses = 0
+    total_steps_list = []
+
+    pbar = tqdm(total=num_games, desc="진단 테스트 진행 중")
+
+    for episode in range(num_games):
+        state, info = env.reset()
+        terminated = False
+        steps = 0
+        
+        # 공정성을 위해 흑/백을 50% 확률로 무작위 배정
+        agent_color = 1 if np.random.rand() < 0.5 else 2
+        heuristic_color = 3 - agent_color
+
+        while not terminated:
+            current_player = info["current_player"]
+            
+            # 100수 제한 무승부 처리
+            if steps >= 100:
+                terminated = True
+                info["winner"] = 0
+                break
+
+            # 모델이 2인(백)일 경우 상태 반전 (Canonical State)
+            if current_player == 2:
+                canonical_state = np.where(state != 0, 3 - state, 0)
+            else:
+                canonical_state = state.copy()
+
+            # 턴에 맞는 에이전트 행동 선택
+            if current_player == agent_color:
+                action = agent.select_action(canonical_state, move_count=steps)
+            else:
+                # HeuristicAgent의 select_action 파라미터에 맞게 조정 (보통 canonical_state 사용)
+                action = heuristic.select_action(canonical_state, move_count=steps) 
+
+            state, reward, terminated, _, info = env.step(action)
+            steps += 1
+
+        total_steps_list.append(steps)
+        winner = info.get("winner")
+
+        # 결과 기록
+        if winner == agent_color:
+            agent_wins += 1
+        elif winner == 0:
+            draws += 1
+        else:
+            agent_losses += 1
+            
+        pbar.set_postfix({"승": agent_wins, "무": draws, "패": agent_losses})
+        pbar.update(1)
+
+    pbar.close()
+    env.close()
+
+    # 최종 결과 분석 및 출력
+    win_rate = (agent_wins / num_games) * 100
+    avg_steps = sum(total_steps_list) / num_games
+
+    print(f"\n{'='*50}")
+    print(f"📊 최종 진단 결과 보고서")
+    print(f"{'-'*50}")
+    print(f"총 대국 수 : {num_games}판")
+    print(f"승리(Win)  : {agent_wins}판")
+    print(f"무승부(Draw): {draws}판")
+    print(f"패배(Loss) : {agent_losses}판")
+    print(f"평균 수순  : {avg_steps:.1f}수")
+    print(f"최종 승률  : {win_rate:.1f}%")
+    print(f"{'='*50}\n")
     
 # ==========================================
 # 4. 메인
@@ -986,3 +1058,4 @@ def train_main():
 if __name__ == "__main__":
     main()
     # train_main()
+    # evaluate_vs_heuristic("khy_omok_levelup2.pth", num_games=100)
