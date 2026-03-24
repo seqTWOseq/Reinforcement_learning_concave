@@ -1,0 +1,176 @@
+# Gomoku2 (오목 PPO + Self-play AI)
+
+15x15 오목을 대상으로 PPO 강화학습 + Self-play + 규칙 기반 보조를 사용하는 AI입니다.
+- 요구사항 1: GUI 착수 순서 표시, Action Masking, Multi-channel 관측
+- 요구사항 2: CNN Policy/Value, 8방향 Data Augmentation
+- 요구사항 3: Self-play + Opponent Pool + 주기적 가중치 저장
+- 요구사항 4: 학습 모드(A) / 플레이 모드(B) 분리
+
+주요 파일: gomoku2.py
+
+
+--------------------------------------------
+1. 실행 방법
+--------------------------------------------
+PowerShell에서 프로젝트 폴더로 이동 후 실행:
+
+  cd C:\LangChainAI\concave
+  python gomoku2.py [옵션]
+
+모드는 --mode 인자로 선택합니다.
+- train : PPO Self-play 학습
+- play  : AI vs Human 대결 (기본값)
+
+
+--------------------------------------------
+2. 학습 모드 (train)
+--------------------------------------------
+명령 예:
+
+  python gomoku2.py --mode train
+
+옵션:
+  --total_timesteps   학습 총 스텝 (기본: 200000)
+  --save_interval     가중치 저장 주기 (기본: 10000)
+  --model_dir         모델 저장/로드 디렉터리 (기본: gomoku_models)
+  --render_train      학습 중 GUI 렌더링 (플래그)
+  --device            auto / cpu / cuda (기본: auto)
+  --resume            이어서 학습할 .pth 경로
+
+동작 요약:
+- PPO 에이전트가 흑을 두고, 상대(백)는 Opponent Pool에서 뽑은 과거 모델 또는 자기 자신이 둡니다.
+- 착수 시 "규칙 기반 우선순위"를 먼저 적용하고, 규칙으로 결정되지 않으면 PPO 정책으로 행동을 선택합니다.
+- 수집한 trajectory는 8방향 대칭 증강 후 PPO 버퍼에 넣고, 에피소드 종료 시 PPO 업데이트를 수행합니다.
+- save_interval마다 gomoku_models/gomoku_ppo_{step}.pth 로 저장하고, Opponent Pool에 추가합니다.
+- 학습 종료 시 gomoku_ppo_final.pth 를 저장합니다.
+
+주의: Human 데이터 수집/Behavioral Cloning 단계는 없습니다. 처음부터 Self-play만 합니다.
+
+
+--------------------------------------------
+3. 플레이 모드 (play) — AI vs Human
+--------------------------------------------
+명령 예:
+
+  python gomoku2.py --mode play
+  python gomoku2.py --mode play --model_path gomoku_models\gomoku_ppo_final.pth --human_black
+
+옵션:
+  --model_path   불러올 모델 .pth 경로 (없으면 model_dir/gomoku_ppo_final.pth)
+  --model_dir    모델 디렉터리 (기본: gomoku_models)
+  --human_black  사람이 흑 (기본: True)
+  --device       auto / cpu / cuda
+
+동작:
+- Tkinter GUI가 뜨고, 사람 차례에는 빈 칸을 클릭해 착수합니다.
+- AI 차례에는 규칙 기반 수가 있으면 그 수를 두고, 없으면 학습된 CNN 모델이 deterministic으로 둡니다.
+- 돌 위에는 착수 순서(숫자)가 표시됩니다 (흑: 흰색 숫자, 백: 검은색 숫자).
+
+
+--------------------------------------------
+4. 코드 구조 요약
+--------------------------------------------
+4-0. 보상 (Reward)
+환경(step)에서 주는 즉시 보상:
+  - 승리 (5목 완성):     +1.0  (info["reason"]=="win", info["winner"]=현재 플레이어)
+  - 무승부 (빈 칸 없음):  0.0   (info["reason"]=="draw", info["winner"]=0)
+  - 진행 중 (다음 턴):   0.0   (terminated=False)
+  - 반칙 (이미 돌 있는 칸): -10.0 (terminated=True, info["winner"]=상대 → 상대 승리 처리)
+
+PPO 학습 시 (우리 모델=흑 기준):
+  - 우리가 승리한 에피소드: 마지막 transition의 보상은 환경이 준 +1.0 그대로 사용.
+  - 우리가 진 에피소드 (상대가 백으로 승리): buffer.set_last_reward(-1.0)로 마지막 수의 보상을 -1로 덮어씀.
+  - 무승부: 마지막 보상 0.0 유지 (별도 덮어쓰기 없음).
+
+공격/방어 쉐이핑 보상 (규칙 1~7에 해당하는 행동 시 추가 보상):
+  학습 시 매 턴, 선택한 행동이 아래 규칙에 해당하는지 get_rule_tier()로 판별하고,
+  해당 tier에 맞는 추가 보상을 환경 보상에 더한 뒤 buffer.add(..., total_reward, ...)로 넣습니다.
+  - tier 1 (내 즉시 승리 수):     +0.12  (환경에서 이미 +1 주므로 소량)
+  - tier 2 (상대 즉시 승리 차단): +0.28
+  - tier 3 (상대 OOㅁO 차단):     +0.22
+  - tier 4 (상대 4줄 차단):       +0.18
+  - tier 5 (상대 열린 3 차단):   +0.14
+  - tier 6 (내 4줄 만들기):       +0.16
+  - tier 7 (내 열린 3 만들기):    +0.08
+  - tier 0 (해당 없음):           ㅡ 0
+  값은 gomoku2.py의 SHAPING_REWARD_BY_TIER로 조정 가능합니다.
+
+returns(할인 누적 보상)는 PPOBuffer.finish_trajectory()에서 (환경 보상 + 쉐이핑)으로 계산된 보상들로 계산되고, advantage 정규화 후 PPO 업데이트에 사용됩니다.
+
+
+4-1. 오목 환경 (OmokEnv)
+- Gymnasium Env. 관측 shape (3, 15, 15):
+  - channel 0: 현재 플레이어의 돌 (1.0/0.0)
+  - channel 1: 상대 돌 (1.0/0.0)
+  - channel 2: 턴 채널 (흑이면 1.0, 백이면 0.0)
+- action_space: Discrete(225), action = row*15 + col
+- info["action_mask"]: (225,) 1=빈 칸(가능), 0=이미 돌 있음(불가)
+- move_order: 각 칸에 몇 번째 수인지 저장 (GUI용)
+- 렌주룰 없음, 5목이면 승리
+
+4-2. 규칙 기반 행동 (select_action_with_rules)
+우선순위:
+  1) 내 즉시 승리 수 (5목 완성)
+  2) 상대 즉시 승리 수 차단
+  3) 상대 OOㅁO (가운데 빈 4목) 차단
+  4) 상대 4줄 차단
+  5) 상대 열린 3 차단
+  6) 내 4줄 만들기
+  7) 내 열린 3 만들기
+해당하는 수가 없으면 None 반환 → PPO가 행동 선택.
+
+4-3. Data Augmentation (8방향)
+- augment_obs_action(obs, action): (obs, action) 쌍을 8가지 대칭으로 생성
+  (원본, 90/180/270도 회전, 좌우 반전, 상하 반전, 그 조합)
+- augment_mask(mask, action): 동일 변환에 맞춰 mask (225,) 8개 생성
+- PPO 버퍼의 finish_trajectory()에서 에피소드 종료 시 적용해 데이터 8배 확장
+
+4-4. CNN (GomokuCNN)
+- 입력: (B, 3, 15, 15)
+- Conv2d 3x3 3채널 → 64채널 3층 (공유 백본)
+- policy_fc: flatten → 128 hidden → 225 (logits)
+- value_fc: flatten → 128 hidden → 1 (value)
+- get_action(obs, mask, deterministic): mask 적용 후 샘플링 또는 argmax
+
+4-5. PPO
+- PPOBuffer: (obs, action, mask, reward, value, logp_old) 수집
+  - finish_trajectory()에서 returns 계산, advantage 정규화, 8방향 증강 적용
+- ppo_update(): clip_eps=0.2, value_coef, ent_coef 사용
+  - logits에 action mask 적용 후 Categorical 분포로 log_prob 계산
+  - ratio = exp(logp - logp_old), clipped surrogate loss
+  - value_loss = MSE(value, returns)
+- NaN/Inf 감지 시 업데이트 스킵 (학습 중단 안내 메시지 출력)
+
+4-6. Opponent Pool
+- model_dir 내 *.pth 파일을 mtime 기준으로 정렬해 최근 max_pool_size개 유지
+- sample_opponent(current_path): current_path 제외한 경로 중 랜덤 선택
+- 학습 시 50% 확률로 풀에서 상대 선택, 없으면 자기 자신과 self-play
+
+4-7. Human Agent
+- GUI 캔버스 클릭으로 (r,c) 계산 → action = r*15+c
+- state flatten 기준으로 빈 칸(0)일 때만 action 수락
+
+
+--------------------------------------------
+5. PPO가 이 코드에서 쓰이는 방식 (요약)
+--------------------------------------------
+- 정책(Actor)과 가치(Critic)를 하나의 GomokuCNN으로 공유 (policy head + value head).
+- 행동 선택 시 이미 돌이 있는 칸은 mask로 제거 (action masking).
+- 학습 시 규칙 기반 수가 있으면 그 수를 두고, 없을 때만 PPO 정책으로 둠 (규칙+PPO 하이브리드).
+- Self-play: 우리(흑) 턴의 transition만 버퍼에 넣고, 상대(백) 턴은 Opponent(과거 모델 또는 자기 자신)가 둠.
+- 에피소드가 끝나면 winner에 따라 우리가 진 경우 마지막 보상을 -1로 설정 후 finish_trajectory() 호출.
+- 버퍼에 쌓인 데이터를 8배 증강한 뒤 배치로 나누어 PPO 업데이트 (여러 epoch 반복).
+
+
+--------------------------------------------
+6. gomooku_last.py 와의 차이 (참고)
+--------------------------------------------
+- gomoku2.py: Human 데이터 수집/BC 없음. 처음부터 규칙+PPO Self-play만 수행. argparse로 --mode train/play.
+- gomooku_last.py: Mode 1 데이터 수집 → Mode 2 BC 사전학습 → Mode 3 PPO Self-play → Mode 4 대결. 메뉴 입력으로 모드 선택.
+
+
+--------------------------------------------
+7. 생성/사용 파일 요약
+--------------------------------------------
+- 학습 시: gomoku_models/gomoku_ppo_{step}.pth (주기 저장), gomoku_models/gomoku_ppo_final.pth (최종)
+- 플레이 시: --model_path 로 지정한 .pth (기본: gomoku_models/gomoku_ppo_final.pth)

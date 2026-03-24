@@ -1,0 +1,4 @@
+# gomoku2.py 의존성 (기본 파이썬 + tkinter 제외)
+gymnasium>=0.29.0
+numpy>=1.24.0
+torch>=2.0.0
